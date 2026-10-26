@@ -1834,6 +1834,27 @@ mod tests {
         routing_policy::CustomRoutingPolicy, test_utils, tests::TEST_LOGGER, TokioExecutor,
     };
 
+    /// The producer's zstd path round-trips through the consumer's decode
+    /// (`zstd::decode_all`, as in `consumer::engine`) on the bumped zstd.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_compressed_message_round_trips() {
+        let payload = b"pulsar zstd round trip ".repeat(64);
+        let message = ProducerMessage {
+            payload: payload.clone(),
+            ..Default::default()
+        };
+        let compression = Some(Compression::Zstd(Default::default()));
+        let compressed = compress_message(message, &compression).unwrap();
+        assert_eq!(
+            compressed.compression,
+            Some(proto::CompressionType::Zstd.into())
+        );
+        assert_eq!(compressed.uncompressed_size, Some(payload.len() as u32));
+        assert_ne!(compressed.payload, payload);
+        assert_eq!(zstd::decode_all(&compressed.payload[..]).unwrap(), payload);
+    }
+
     #[test]
     fn send_future_errors_when_sender_dropped() {
         let (tx, rx) = futures::channel::oneshot::channel::<Result<CommandSendReceipt, Error>>();
