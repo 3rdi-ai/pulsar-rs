@@ -449,91 +449,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             })?,
         };
 
-        let payload = match compression {
-            proto::CompressionType::None => payload,
-            proto::CompressionType::Lz4 => {
-                #[cfg(not(feature = "lz4"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a LZ4 compressed message but 'lz4' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "lz4")]
-                {
-                    let decompressed_payload = lz4::block::decompress(
-                        &payload.data[..],
-                        payload.metadata.uncompressed_size.map(|i| i as i32),
-                    )
-                    .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Zlib => {
-                #[cfg(not(feature = "flate2"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a zlib compressed message but 'flate2' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "flate2")]
-                {
-                    use std::io::Read;
-
-                    use flate2::read::ZlibDecoder;
-
-                    let mut d = ZlibDecoder::new(&payload.data[..]);
-                    let mut decompressed_payload = Vec::new();
-                    d.read_to_end(&mut decompressed_payload)
-                        .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Zstd => {
-                #[cfg(not(feature = "zstd"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a zstd compressed message but 'zstd' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "zstd")]
-                {
-                    let decompressed_payload =
-                        zstd::decode_all(&payload.data[..]).map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Snappy => {
-                #[cfg(not(feature = "snap"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a Snappy compressed message but 'snap' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "snap")]
-                {
-                    use std::io::Read;
-
-                    let mut decompressed_payload = Vec::new();
-                    let mut decoder = snap::read::FrameDecoder::new(&payload.data[..]);
-                    decoder
-                        .read_to_end(&mut decompressed_payload)
-                        .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-        };
+        payload.data = super::decompress::decompress(
+            compression,
+            std::mem::take(&mut payload.data),
+            payload.metadata.uncompressed_size,
+            super::decompress::DEFAULT_MAX_DECOMPRESSED_SIZE,
+        )
+        .map_err(Error::Consumer)?;
 
         let payloads = if payload.metadata.num_messages_in_batch.is_some() {
             BatchedMessageIterator::new(message.message_id, payload)?.collect()

@@ -4,6 +4,7 @@ mod batched_message_iterator;
 pub mod builder;
 pub mod config;
 pub mod data;
+mod decompress;
 mod engine;
 pub(crate) mod initial_position;
 pub mod message;
