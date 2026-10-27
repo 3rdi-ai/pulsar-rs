@@ -678,13 +678,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         format!(
             "[{id} - {subscription}{name}: {topic}]",
             id = self.id,
-            subscription = &self.subscription,
+            subscription = self.subscription,
             name = self
                 .name
                 .as_ref()
                 .map(|s| format!("({s})"))
                 .unwrap_or_default(),
-            topic = &self.topic
+            topic = self.topic
         )
     }
 
