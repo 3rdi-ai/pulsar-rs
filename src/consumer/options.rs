@@ -48,6 +48,14 @@ pub struct ConsumerOptions {
     /// raising this cap past `max_decompressed_size / 1 KiB` or so needs
     /// that cap raised too.
     pub max_batch_members: Option<u32>,
+    /// The most decoded payload bytes queued for this consumer and not yet
+    /// taken; `None` means [`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`]
+    /// (64 MiB). The engine waits (it stops reading this consumer's
+    /// messages) rather than queue a payload past it; an empty queue always
+    /// takes one payload, so one larger than the budget is still delivered.
+    /// `receiver_queue_size` bounds the count of queued messages, this
+    /// bounds their bytes: whichever is reached first holds the engine.
+    pub max_queued_bytes: Option<usize>,
 }
 
 impl ConsumerOptions {
@@ -64,6 +72,14 @@ impl ConsumerOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_max_batch_members(mut self, members: u32) -> Self {
         self.max_batch_members = Some(members);
+        self
+    }
+
+    /// within options, sets the most decoded payload bytes queued for the
+    /// consumer (see [`ConsumerOptions::max_queued_bytes`])
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_max_queued_bytes(mut self, bytes: usize) -> Self {
+        self.max_queued_bytes = Some(bytes);
         self
     }
 

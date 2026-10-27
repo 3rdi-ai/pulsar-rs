@@ -36,6 +36,62 @@ The cap is `ConsumerOptions::max_decompressed_size` (default
 `DEFAULT_MAX_DECOMPRESSED_SIZE`, 5 MiB), so a topic with large legitimate
 messages can raise it on purpose.
 
+## v6.9.1-3rdi.7
+
+Supersedes `v6.9.1-3rdi.6` (left in place, not deleted).
+
+**New public items** (all additive):
+
+- `ConsumerOptions::max_batch_members` / `with_max_batch_members`, and
+  `consumer::DEFAULT_MAX_BATCH_MEMBERS` (5_000).
+- `ConsumerOptions::max_queued_bytes` / `with_max_queued_bytes`, and
+  `consumer::DEFAULT_MAX_QUEUED_BYTES` (64 MiB).
+
+**Three new batch refusals**, all checked before decompression and all
+settled like any refusal (`DECODE_REFUSAL=undecodable`, dead-lettered when a
+`DeadLetterPolicy` is set, then acknowledged):
+
+- a batch declaring more members than `max_batch_members` (or fewer than one);
+- a batch whose members would copy past `max_decompressed_size`: every member
+  gets its own copy of the envelope metadata, so the bound is
+  `members x (encoded envelope without its member-owned properties,
+  partition_key and ordering_key + size_of MessageMetadata + size_of
+  MessageIdData)`. The two caps interact: raising `max_batch_members` past
+  roughly `max_decompressed_size / 1 KiB` needs `max_decompressed_size`
+  raised too. Peak memory per message is the received bytes plus about three
+  times `max_decompressed_size`;
+- a batch with bytes left over after its declared members. A conforming
+  producer never writes these; a **non-conforming producer's batches are
+  dead-lettered**, not partly delivered.
+
+**Permit accounting** mirrors the broker (`Consumer.java` debits a batch's
+raw `num_messages_in_batch`): the client debits the declared count exactly,
+with no upper clamp, and caps each flow request at `i32::MAX` (the broker
+rejects a non-positive grant). A declared count of zero or less is booked as
+one permit with a `warn!`; the broker debited nothing for it, so the client's
+window runs one short until the next reconnect re-grants it. Before this, a
+batch declaring more than 65535 members stalled the consumer for good
+(broker tests at 70000 and `i32::MAX` members cover it).
+
+**Redaction**: the `Debug` output of `Message` and `Payload` carries no message
+bodies (only `data_len` and `properties_len`) and no credentials
+(`auth_data` and `original_auth_data` on connect, auth challenge/response,
+lookup and partition-metadata commands print as `<redacted>`). Decoder errors
+report the remaining input's length, never its bytes.
+
+**Receive queue budget**: the decoded payloads queued for one consumer are
+bounded by bytes as well as by `receiver_queue_size`. The engine waits
+(without polling) before queueing a payload past `max_queued_bytes` and the
+consumer releases the bytes as it takes each payload; an empty queue always
+admits one payload, so a payload larger than the budget is still delivered.
+Without it, 1000 queued 5 MiB bombs pinned about 5 GiB for a stalled consumer.
+
+**CI note (for when the fork's CI is enabled)**: it needs a job with
+`prophesee-service-rs`'s exact feature set (`default-features = false`,
+`compression`, `tokio-rustls-runtime-aws-lc-rs`). RUSTSEC-2023-0071 (rsa)
+comes in through a default feature only, so a default-features audit reports
+an advisory our consumers never link.
+
 Releases are tagged `v<upstream>-3rdi.<n>`, e.g. `v6.9.1-3rdi.1`.
 
 ## When to drop it

@@ -19,9 +19,10 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, EngineMessage, MessageData, MessageIdDataReceiver},
+        data::{DeadLetterPolicy, EngineMessage, MessageData},
         engine::ConsumerEngine,
         message::Message,
+        queue::{receive_queue, QueueReceiver},
     },
     error::{ConnectionError, ConsumerError},
     message::proto::{MessageIdData, Schema},
@@ -35,7 +36,7 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) consumer_id: u64,
     pub(crate) config: ConsumerConfig,
     topic: String,
-    messages: Pin<Box<MessageIdDataReceiver>>,
+    messages: Pin<Box<QueueReceiver>>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -104,7 +105,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             }
         }
         let receiver_queue_size = options.receiver_queue_size.unwrap_or(1000);
-        let (tx, rx) = mpsc::channel(receiver_queue_size as usize);
+        let (tx, rx) = receive_queue(
+            receiver_queue_size as usize,
+            options
+                .max_queued_bytes
+                .unwrap_or(crate::consumer::DEFAULT_MAX_QUEUED_BYTES),
+        );
         let mut c = ConsumerEngine::new(
             client.clone(),
             connection.clone(),

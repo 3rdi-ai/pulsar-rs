@@ -10,6 +10,7 @@ pub(crate) mod initial_position;
 pub mod message;
 mod multi;
 pub mod options;
+mod queue;
 pub mod topic;
 
 use std::{
@@ -31,6 +32,7 @@ pub use initial_position::InitialPosition;
 pub use message::Message;
 use multi::MultiTopicConsumer;
 pub use options::ConsumerOptions;
+pub use queue::DEFAULT_MAX_QUEUED_BYTES;
 pub use topic::TopicConsumer;
 use url::Url;
 

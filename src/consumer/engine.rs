@@ -15,6 +15,7 @@ use crate::{
     consumer::{
         data::{DeadLetterPolicy, EngineEvent, EngineMessage},
         options::ConsumerOptions,
+        queue::QueueSender,
     },
     error::{ConnectionError, ConsumerError, DecodeRefusal},
     message::{
@@ -71,7 +72,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     sub_type: SubType,
     id: u64,
     name: Option<String>,
-    tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+    tx: QueueSender,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
@@ -94,7 +95,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         sub_type: SubType,
         id: u64,
         name: Option<String>,
-        tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+        tx: QueueSender,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
         batch_size: u32,
