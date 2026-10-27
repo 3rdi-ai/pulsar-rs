@@ -243,11 +243,63 @@ impl std::error::Error for ConnectionError {
     }
 }
 
+/// Why the consumer engine refused to decode a message. Carries no payload
+/// bytes and no message id, so it is safe to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeRefusal {
+    /// The message decodes, or declares it decodes, past the consumer's
+    /// `max_decompressed_size`.
+    OverCap { limit: usize },
+    /// The decoded length differs from the declared `uncompressed_size`.
+    SizeMismatch { declared: u32, actual: usize },
+    /// The payload could not be decoded at all (corrupt frame, unknown or
+    /// disabled codec, lz4 without a declared size).
+    Undecodable(String),
+}
+
+impl DecodeRefusal {
+    /// A stable, bounded label for metrics: `over_cap`, `size_mismatch` or
+    /// `undecodable`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecodeRefusal::OverCap { .. } => "over_cap",
+            DecodeRefusal::SizeMismatch { .. } => "size_mismatch",
+            DecodeRefusal::Undecodable(_) => "undecodable",
+        }
+    }
+}
+
+impl fmt::Display for DecodeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DecodeRefusal::OverCap { limit } => {
+                write!(f, "the message decodes past the {limit}-byte cap")
+            }
+            DecodeRefusal::SizeMismatch { declared, actual } => {
+                write!(
+                    f,
+                    "decoded {actual} bytes but the message declared {declared}"
+                )
+            }
+            DecodeRefusal::Undecodable(why) => {
+                write!(f, "the message could not be decoded: {why}")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ConsumerError {
     Connection(ConnectionError),
-    MissingPayload(String),
     Io(io::Error),
+    /// The engine refused to decode a message (see [`DecodeRefusal`]) and
+    /// SETTLED it: sent it, still compressed, to the dead-letter topic when a
+    /// policy is configured (`dead_lettered`), and acknowledged it either way,
+    /// so the broker never redelivers it.
+    Refused {
+        reason: DecodeRefusal,
+        dead_lettered: bool,
+    },
     ChannelFull,
     Closed,
     BuildError,
@@ -283,8 +335,19 @@ impl fmt::Display for ConsumerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ConsumerError::Connection(e) => write!(f, "Connection error: {e}"),
-            ConsumerError::MissingPayload(s) => write!(f, "Missing payload: {s}"),
             ConsumerError::Io(s) => write!(f, "Decompression error: {s}"),
+            ConsumerError::Refused {
+                reason,
+                dead_lettered,
+            } => write!(
+                f,
+                "message refused and {}: {reason}",
+                if *dead_lettered {
+                    "dead-lettered"
+                } else {
+                    "acknowledged"
+                }
+            ),
             ConsumerError::ChannelFull => write!(
                 f,
                 "cannot send message to the consumer engine: the channel is full"

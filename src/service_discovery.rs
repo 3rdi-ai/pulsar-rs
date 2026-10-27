@@ -278,7 +278,7 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         let topic = topic.into();
         let partitions = self.lookup_partitioned_topic_number(&topic).await?;
 
-        trace!("Partitions for topic {}: {}", &topic, &partitions);
+        trace!("Partitions for topic {}: {}", topic, partitions);
         let topics = match partitions {
             0 => vec![topic],
             _ => (0..partitions)

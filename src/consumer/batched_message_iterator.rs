@@ -1,6 +1,5 @@
 use crate::{
-    error::ConnectionError,
-    message::{parse_batched_message, proto::MessageIdData, BatchedMessage, Metadata},
+    message::{proto::MessageIdData, BatchedMessage, Metadata},
     Payload,
 };
 
@@ -13,21 +12,20 @@ pub struct BatchedMessageIterator {
 }
 
 impl BatchedMessageIterator {
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn new(message_id: MessageIdData, payload: Payload) -> Result<Self, ConnectionError> {
-        let total_messages = payload
-            .metadata
-            .num_messages_in_batch
-            .expect("expected batched message") as u32;
-        let messages = parse_batched_message(total_messages, &payload.data)?;
-
-        Ok(Self {
+    /// The iterator over a batch whose member table is already parsed.
+    pub(crate) fn from_members(
+        message_id: MessageIdData,
+        metadata: Metadata,
+        total_messages: u32,
+        messages: Vec<BatchedMessage>,
+    ) -> Self {
+        Self {
             messages: messages.into_iter(),
             message_id,
             total_messages,
-            metadata: payload.metadata,
+            metadata,
             current_index: 0,
-        })
+        }
     }
 }
 
@@ -116,16 +114,16 @@ mod tests {
             data,
         };
 
-        let expanded: Vec<_> = BatchedMessageIterator::new(
+        let expanded = crate::consumer::decompress::decode_payload(
             MessageIdData {
                 ledger_id: 1,
                 entry_id: 2,
                 ..Default::default()
             },
             payload,
+            usize::MAX,
         )
-        .unwrap()
-        .collect();
+        .unwrap();
 
         assert_eq!(expanded.len(), 2);
         assert_eq!(

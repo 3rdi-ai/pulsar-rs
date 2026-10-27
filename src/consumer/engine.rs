@@ -13,11 +13,10 @@ use futures::{
 use crate::{
     connection::Connection,
     consumer::{
-        batched_message_iterator::BatchedMessageIterator,
         data::{DeadLetterPolicy, EngineEvent, EngineMessage},
         options::ConsumerOptions,
     },
-    error::{ConnectionError, ConsumerError},
+    error::{ConnectionError, ConsumerError, DecodeRefusal},
     message::{
         proto::{command_subscribe::SubType, MessageIdData},
         Message as RawMessage,
@@ -31,6 +30,15 @@ use crate::{
 
 const SYSTEM_PROPERTY_REAL_TOPIC: &str = "REAL_TOPIC";
 const SYSTEM_PROPERTY_ORIGIN_MESSAGE_ID: &str = "ORIGIN_MESSAGE_ID";
+/// Set on a dead-lettered message the engine refused to decode: the
+/// [`DecodeRefusal::as_str`] label.
+const SYSTEM_PROPERTY_DECODE_REFUSAL: &str = "DECODE_REFUSAL";
+/// Set on a dead-lettered refused message that arrived compressed: the codec
+/// name (`ZSTD`, `LZ4`, ...); the payload is the compressed bytes as received.
+const SYSTEM_PROPERTY_ORIGINAL_COMPRESSION: &str = "ORIGINAL_COMPRESSION";
+/// Set alongside [`SYSTEM_PROPERTY_ORIGINAL_COMPRESSION`] when the message
+/// declared one: its `uncompressed_size`.
+const SYSTEM_PROPERTY_ORIGINAL_UNCOMPRESSED_SIZE: &str = "ORIGINAL_UNCOMPRESSED_SIZE";
 
 pub struct ConsumerEngine<Exe: Executor> {
     client: Pulsar<Exe>,
@@ -393,6 +401,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             } => {
                 self.process_payload(message, payload).await?;
             }
+            // The broker never sends a CommandMessage without its payload; a
+            // frame that parsed without one is logged and dropped (nothing is
+            // delivered, so nothing reaches the consumer stream).
             RawMessage {
                 command: BaseCommand {
                     message: Some(_), ..
@@ -437,168 +448,152 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     async fn process_payload(
         &mut self,
         message: CommandMessage,
-        mut payload: Payload,
+        payload: Payload,
     ) -> Result<(), Error> {
-        let compression = match payload.metadata.compression {
-            None => proto::CompressionType::None,
-            Some(compression) => proto::CompressionType::try_from(compression).map_err(|err| {
-                error!("unknown compression type: {}", compression);
-                Error::Consumer(ConsumerError::Io(std::io::Error::other(format!(
-                    "unknown compression type {compression}: {err}"
-                ))))
-            })?,
-        };
-
-        let payload = match compression {
-            proto::CompressionType::None => payload,
-            proto::CompressionType::Lz4 => {
-                #[cfg(not(feature = "lz4"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a LZ4 compressed message but 'lz4' cargo feature is deactivated",
-                    ))));
+        let limit = self
+            .options
+            .max_decompressed_size
+            .unwrap_or(super::decompress::DEFAULT_MAX_DECOMPRESSED_SIZE);
+        let payloads =
+            match super::decompress::decode_payload(message.message_id.clone(), payload, limit) {
+                Ok(payloads) => payloads,
+                Err(refused) => {
+                    let (payload, reason) = *refused;
+                    return Err(self.settle_refused(message, payload, reason).await);
                 }
-
-                #[cfg(feature = "lz4")]
-                {
-                    let decompressed_payload = lz4::block::decompress(
-                        &payload.data[..],
-                        payload.metadata.uncompressed_size.map(|i| i as i32),
-                    )
-                    .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Zlib => {
-                #[cfg(not(feature = "flate2"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a zlib compressed message but 'flate2' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "flate2")]
-                {
-                    use std::io::Read;
-
-                    use flate2::read::ZlibDecoder;
-
-                    let mut d = ZlibDecoder::new(&payload.data[..]);
-                    let mut decompressed_payload = Vec::new();
-                    d.read_to_end(&mut decompressed_payload)
-                        .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Zstd => {
-                #[cfg(not(feature = "zstd"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a zstd compressed message but 'zstd' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "zstd")]
-                {
-                    let decompressed_payload =
-                        zstd::decode_all(&payload.data[..]).map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-            proto::CompressionType::Snappy => {
-                #[cfg(not(feature = "snap"))]
-                {
-                    return Err(Error::Consumer(ConsumerError::Io(std::io::Error::other(
-                        "got a Snappy compressed message but 'snap' cargo feature is deactivated",
-                    ))));
-                }
-
-                #[cfg(feature = "snap")]
-                {
-                    use std::io::Read;
-
-                    let mut decompressed_payload = Vec::new();
-                    let mut decoder = snap::read::FrameDecoder::new(&payload.data[..]);
-                    decoder
-                        .read_to_end(&mut decompressed_payload)
-                        .map_err(ConsumerError::Io)?;
-
-                    payload.data = decompressed_payload;
-                    payload
-                }
-            }
-        };
-
-        let payloads = if payload.metadata.num_messages_in_batch.is_some() {
-            BatchedMessageIterator::new(message.message_id, payload)?.collect()
-        } else {
-            vec![(message.message_id, payload)]
-        };
+            };
         for (message_id, payload) in payloads {
-            match (message.redelivery_count, &self.dead_letter_policy) {
+            match (message.redelivery_count, self.dead_letter_policy.clone()) {
                 (Some(redelivery_count), Some(dead_letter_policy))
                     if redelivery_count as usize >= dead_letter_policy.max_redeliver_count =>
                 {
                     // Send message to Dead Letter Topic and ack message in original topic
-                    let Payload { data, metadata } = payload;
-                    let mut properties = metadata
-                        .properties
-                        .into_iter()
-                        .map(|p| (p.key, p.value))
-                        .collect::<HashMap<_, _>>();
-                    properties
-                        .entry(SYSTEM_PROPERTY_REAL_TOPIC.to_string())
-                        .or_insert_with(|| self.topic.clone());
-                    properties
-                        .entry(SYSTEM_PROPERTY_ORIGIN_MESSAGE_ID.to_string())
-                        .or_insert_with(|| {
-                            if let Some(batch_index) = message_id.batch_index {
-                                format!(
-                                    "{}:{}:{}:{}",
-                                    message_id.ledger_id,
-                                    message_id.entry_id,
-                                    message_id.partition.unwrap_or(-1),
-                                    batch_index
-                                )
-                            } else {
-                                format!(
-                                    "{}:{}:{}",
-                                    message_id.ledger_id,
-                                    message_id.entry_id,
-                                    message_id.partition.unwrap_or(-1)
-                                )
-                            }
-                        });
-                    let message = Message {
-                        payload: data,
-                        properties,
-                        partition_key: metadata.partition_key,
-                        partition_key_b64_encoded: metadata.partition_key_b64_encoded,
-                        ordering_key: metadata.ordering_key,
-                        event_time: metadata.event_time,
-                        ..Default::default()
-                    };
-                    self.client
-                        .send(&dead_letter_policy.dead_letter_topic, message)
-                        .await?
-                        .await
-                        .map_err(|e| {
-                            error!("One shot cancelled {:?}", e);
-                            Error::Custom("DLQ send error".to_string())
-                        })?;
-
+                    let message = self.dead_letter_message(&message_id, payload);
+                    self.send_to_dead_letter(&dead_letter_policy.dead_letter_topic, message)
+                        .await?;
                     self.ack(message_id, false).await;
                 }
                 _ => self.send_to_consumer(message_id, payload).await?,
             }
         }
         Ok(())
+    }
+
+    /// The dead-letter copy of `payload`: its data, properties and keys,
+    /// plus the real topic and the origin message id.
+    fn dead_letter_message(&self, message_id: &MessageIdData, payload: Payload) -> Message {
+        let Payload { data, metadata } = payload;
+        let mut properties = metadata
+            .properties
+            .into_iter()
+            .map(|p| (p.key, p.value))
+            .collect::<HashMap<_, _>>();
+        properties
+            .entry(SYSTEM_PROPERTY_REAL_TOPIC.to_string())
+            .or_insert_with(|| self.topic.clone());
+        properties
+            .entry(SYSTEM_PROPERTY_ORIGIN_MESSAGE_ID.to_string())
+            .or_insert_with(|| {
+                if let Some(batch_index) = message_id.batch_index {
+                    format!(
+                        "{}:{}:{}:{}",
+                        message_id.ledger_id,
+                        message_id.entry_id,
+                        message_id.partition.unwrap_or(-1),
+                        batch_index
+                    )
+                } else {
+                    format!(
+                        "{}:{}:{}",
+                        message_id.ledger_id,
+                        message_id.entry_id,
+                        message_id.partition.unwrap_or(-1)
+                    )
+                }
+            });
+        Message {
+            payload: data,
+            properties,
+            partition_key: metadata.partition_key,
+            partition_key_b64_encoded: metadata.partition_key_b64_encoded,
+            ordering_key: metadata.ordering_key,
+            event_time: metadata.event_time,
+            ..Default::default()
+        }
+    }
+
+    /// Publishes `message` to the dead-letter `topic` and waits for the receipt.
+    async fn send_to_dead_letter(&self, topic: &str, message: Message) -> Result<(), Error> {
+        self.client.send(topic, message).await?.await.map_err(|e| {
+            error!("One shot cancelled {:?}", e);
+            Error::Custom("DLQ send error".to_string())
+        })?;
+        Ok(())
+    }
+
+    /// Settles a message the engine refused to decode, so the broker never
+    /// redelivers it: an unsettled refusal comes back on every reconnect and,
+    /// on a Shared subscription, piles up until the consumer stalls.
+    ///
+    /// With a dead-letter policy the message goes to the dead-letter topic as
+    /// it arrived (still compressed), tagged with the refusal; it is then
+    /// acknowledged either way. Returns the error the consumer stream yields:
+    /// [`ConsumerError::Refused`], or the dead-letter send's own error, in
+    /// which case the message is NOT acknowledged and the broker redelivers it.
+    /// Nothing logged here carries payload bytes or the message id.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn settle_refused(
+        &mut self,
+        message: CommandMessage,
+        payload: Payload,
+        reason: DecodeRefusal,
+    ) -> Error {
+        let message_id = message.message_id;
+        warn!(
+            "{}: refusing a message ({}): {reason}",
+            self.debug_format(),
+            reason.as_str()
+        );
+        let dead_lettered = match self.dead_letter_policy.clone() {
+            Some(policy) => {
+                let compression = payload
+                    .metadata
+                    .compression
+                    .and_then(|c| proto::CompressionType::try_from(c).ok())
+                    .filter(|c| *c != proto::CompressionType::None);
+                let uncompressed_size = payload.metadata.uncompressed_size;
+                let mut dead_letter = self.dead_letter_message(&message_id, payload);
+                dead_letter.properties.insert(
+                    SYSTEM_PROPERTY_DECODE_REFUSAL.to_string(),
+                    reason.as_str().to_string(),
+                );
+                if let Some(compression) = compression {
+                    dead_letter.properties.insert(
+                        SYSTEM_PROPERTY_ORIGINAL_COMPRESSION.to_string(),
+                        compression.as_str_name().to_string(),
+                    );
+                    if let Some(size) = uncompressed_size {
+                        dead_letter.properties.insert(
+                            SYSTEM_PROPERTY_ORIGINAL_UNCOMPRESSED_SIZE.to_string(),
+                            size.to_string(),
+                        );
+                    }
+                }
+                if let Err(e) = self
+                    .send_to_dead_letter(&policy.dead_letter_topic, dead_letter)
+                    .await
+                {
+                    return e;
+                }
+                true
+            }
+            None => false,
+        };
+        self.ack(message_id, false).await;
+        Error::Consumer(ConsumerError::Refused {
+            reason,
+            dead_lettered,
+        })
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -663,13 +658,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         format!(
             "[{id} - {subscription}{name}: {topic}]",
             id = self.id,
-            subscription = &self.subscription,
+            subscription = self.subscription,
             name = self
                 .name
                 .as_ref()
                 .map(|s| format!("({s})"))
                 .unwrap_or_default(),
-            topic = &self.topic
+            topic = self.topic
         )
     }
 

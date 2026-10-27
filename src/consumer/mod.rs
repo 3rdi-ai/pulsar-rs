@@ -4,6 +4,7 @@ mod batched_message_iterator;
 pub mod builder;
 pub mod config;
 pub mod data;
+mod decompress;
 mod engine;
 pub(crate) mod initial_position;
 pub mod message;
@@ -20,6 +21,7 @@ use std::{
 pub use builder::ConsumerBuilder;
 use chrono::{DateTime, Utc};
 pub use data::{DeadLetterPolicy, EngineMessage};
+pub use decompress::DEFAULT_MAX_DECOMPRESSED_SIZE;
 use futures::{
     future::try_join_all,
     task::{Context, Poll},
@@ -1915,6 +1917,269 @@ mod tests {
             "schemaless producer should not carry a non-empty schema_version, got {sv:?}"
         );
 
+        consumer.ack(&msg).await.unwrap();
+    }
+
+    /// Decodes to 8 MiB of zeros: past the 5 MiB default cap, tiny on the wire.
+    #[cfg(feature = "zstd")]
+    const BOMB_DECODED_LEN: usize = 8 * 1024 * 1024;
+
+    #[cfg(feature = "zstd")]
+    async fn zstd_producer(
+        client: &Pulsar<TokioExecutor>,
+        topic: &str,
+    ) -> crate::producer::Producer<TokioExecutor> {
+        client
+            .producer()
+            .with_topic(topic)
+            .with_options(producer::ProducerOptions {
+                compression: Some(crate::compression::Compression::Zstd(Default::default())),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "zstd")]
+    async fn publish(producer: &mut crate::producer::Producer<TokioExecutor>, data: Vec<u8>) {
+        producer
+            .send_non_blocking(data)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "zstd")]
+    async fn shared_earliest_consumer(
+        client: &Pulsar<TokioExecutor>,
+        topic: &str,
+        subscription: &str,
+        dead_letter_policy: Option<DeadLetterPolicy>,
+    ) -> Consumer<Vec<u8>, TokioExecutor> {
+        let mut builder = client
+            .consumer()
+            .with_topic(topic)
+            .with_subscription(subscription)
+            .with_subscription_type(SubType::Shared)
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                ..Default::default()
+            });
+        if let Some(policy) = dead_letter_policy {
+            builder = builder.with_dead_letter_policy(policy);
+        }
+        builder.build().await.unwrap()
+    }
+
+    /// A message refused for decoding past the cap must be SETTLED, not left
+    /// unacked: a consumer that takes over the subscription (a reconnect or a
+    /// rebuild) must never be handed it again.
+    #[tokio::test]
+    #[cfg(feature = "zstd")]
+    async fn an_over_cap_message_is_settled_and_never_redelivered() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("over_cap_settled_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = zstd_producer(&client, &topic).await;
+
+        let mut first = shared_earliest_consumer(&client, &topic, "settle", None).await;
+        publish(&mut producer, vec![0u8; BOMB_DECODED_LEN]).await;
+        publish(&mut producer, b"after".to_vec()).await;
+
+        let refused = timeout(DEFAULT_RECV_TIMEOUT, first.next())
+            .await
+            .expect("the refusal must surface on the stream")
+            .expect("stream open");
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Consumer(crate::error::ConsumerError::Refused {
+                    reason: crate::error::DecodeRefusal::OverCap { .. },
+                    dead_lettered: false,
+                }))
+            ),
+            "the bomb must be refused and acknowledged, got {refused:?}"
+        );
+        let after = recv_within(&mut first, DEFAULT_RECV_TIMEOUT).await.unwrap();
+        assert_eq!(after.payload.data, b"after".to_vec());
+        first.ack(&after).await.unwrap();
+        first.close().await.unwrap();
+        drop(first);
+
+        let mut second = shared_earliest_consumer(&client, &topic, "settle", None).await;
+        publish(&mut producer, b"third".to_vec()).await;
+        let next = recv_within(&mut second, DEFAULT_RECV_TIMEOUT)
+            .await
+            .expect("the takeover consumer must get the next message, not the refused one");
+        assert_eq!(next.payload.data, b"third".to_vec());
+        second.ack(&next).await.unwrap();
+    }
+
+    /// With a dead-letter policy, a refused message goes to the dead-letter
+    /// topic as it arrived (still compressed), whatever its redelivery count.
+    #[tokio::test]
+    #[cfg(feature = "zstd")]
+    async fn an_over_cap_message_lands_compressed_on_the_dead_letter_topic() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("over_cap_dlq_{test_id}");
+        let dead_letter_topic = format!("{topic}_dlq");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = zstd_producer(&client, &topic).await;
+
+        let policy = DeadLetterPolicy {
+            max_redeliver_count: 3,
+            dead_letter_topic: dead_letter_topic.clone(),
+        };
+        let mut consumer =
+            shared_earliest_consumer(&client, &topic, "dlq-refusal", Some(policy)).await;
+        let mut dlq =
+            shared_earliest_consumer(&client, &dead_letter_topic, "dlq-reader", None).await;
+        publish(&mut producer, vec![0u8; BOMB_DECODED_LEN]).await;
+
+        let refused = timeout(DEFAULT_RECV_TIMEOUT, consumer.next())
+            .await
+            .expect("the refusal must surface on the stream")
+            .expect("stream open");
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Consumer(crate::error::ConsumerError::Refused {
+                    reason: crate::error::DecodeRefusal::OverCap { .. },
+                    dead_lettered: true,
+                }))
+            ),
+            "the bomb must be refused and dead-lettered, got {refused:?}"
+        );
+
+        let parked = recv_within(&mut dlq, Duration::from_secs(15))
+            .await
+            .expect("the refused message must land on the dead-letter topic");
+        assert!(
+            parked.payload.data.len() < 64 * 1024,
+            "the dead-lettered copy must be the compressed bytes, got {} bytes",
+            parked.payload.data.len()
+        );
+        assert_eq!(
+            zstd::decode_all(&parked.payload.data[..]).unwrap().len(),
+            BOMB_DECODED_LEN
+        );
+        let properties: HashMap<_, _> = parked
+            .payload
+            .metadata
+            .properties
+            .iter()
+            .map(|p| (p.key.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(properties.get("DECODE_REFUSAL"), Some(&"over_cap"));
+        assert_eq!(properties.get("ORIGINAL_COMPRESSION"), Some(&"ZSTD"));
+        assert_eq!(
+            properties
+                .get("REAL_TOPIC")
+                .map(|t| t.ends_with(topic.as_str())),
+            Some(true)
+        );
+        dlq.ack(&parked).await.unwrap();
+    }
+
+    /// A refused message whose dead-letter send FAILS is not acknowledged:
+    /// the stream yields the send's own error (not a `Refused`, so a caller
+    /// treats it as the consumer failing, never as a skipped message) and the
+    /// broker redelivers the message to the next consumer on the subscription.
+    #[tokio::test]
+    #[cfg(feature = "zstd")]
+    async fn a_failed_dead_letter_send_leaves_the_refused_message_unacknowledged() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("over_cap_dlq_fails_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = zstd_producer(&client, &topic).await;
+
+        // A tenant that does not exist: the dead-letter producer cannot be created.
+        let policy = DeadLetterPolicy {
+            max_redeliver_count: 3,
+            dead_letter_topic: format!("persistent://no-such-tenant-{test_id}/ns/dlq"),
+        };
+        let mut first = shared_earliest_consumer(&client, &topic, "dlq-fails", Some(policy)).await;
+        publish(&mut producer, vec![0u8; BOMB_DECODED_LEN]).await;
+
+        let failed = timeout(Duration::from_secs(120), first.next())
+            .await
+            .expect("the failed dead-letter send must surface on the stream")
+            .expect("stream open");
+        assert!(failed.is_err(), "expected an error, got a message");
+        assert!(
+            !matches!(
+                failed,
+                Err(Error::Consumer(crate::error::ConsumerError::Refused { .. }))
+            ),
+            "a failed dead-letter send must not read as a settled refusal: {failed:?}"
+        );
+        let _ = first.close().await;
+        drop(first);
+
+        let mut second: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("dlq-fails")
+            .with_subscription_type(SubType::Shared)
+            .with_options(
+                ConsumerOptions {
+                    initial_position: InitialPosition::Earliest,
+                    ..Default::default()
+                }
+                .with_max_decompressed_size(2 * BOMB_DECODED_LEN),
+            )
+            .build()
+            .await
+            .unwrap();
+        let redelivered = recv_within(&mut second, Duration::from_secs(30))
+            .await
+            .expect("the unacknowledged message must be redelivered");
+        assert_eq!(redelivered.payload.data.len(), BOMB_DECODED_LEN);
+        second.ack(&redelivered).await.unwrap();
+    }
+
+    /// A consumer that raised `max_decompressed_size` on purpose receives a
+    /// message the default cap would refuse.
+    #[tokio::test]
+    #[cfg(feature = "zstd")]
+    async fn a_raised_cap_delivers_a_large_message() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("raised_cap_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = zstd_producer(&client, &topic).await;
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("raised-cap")
+            .with_options(
+                ConsumerOptions {
+                    initial_position: InitialPosition::Earliest,
+                    ..Default::default()
+                }
+                .with_max_decompressed_size(2 * BOMB_DECODED_LEN),
+            )
+            .build()
+            .await
+            .unwrap();
+        publish(&mut producer, vec![0u8; BOMB_DECODED_LEN]).await;
+        let msg = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(msg.payload.data.len(), BOMB_DECODED_LEN);
         consumer.ack(&msg).await.unwrap();
     }
 }
