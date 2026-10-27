@@ -28,18 +28,14 @@ use crate::{
     Error, Executor, Payload, Pulsar,
 };
 
-/// The most permits one broker entry is counted as consuming: far above
-/// any real batch (Java producers default to 1000 members), so one hostile
-/// count cannot make the next flow request unbounded.
-const MAX_PERMITS_PER_ENTRY: i64 = u16::MAX as i64;
-
-/// The permits one broker entry consumed. The broker charges an entry the
-/// `num_messages_in_batch` of the same metadata this client receives, so an
-/// honest batch counts as its member count. The field is publisher-written:
-/// zero or negative still counts 1 (the entry used the window) and a huge
-/// value counts [`MAX_PERMITS_PER_ENTRY`].
+/// The permits one broker entry consumed, booked exactly as the broker
+/// debits them: the declared `num_messages_in_batch`, unclamped
+/// (`AbstractBaseDispatcher` sums it, `Consumer.sendMessages` subtracts
+/// it), so the window mirrors the broker's and the next flow re-grants it.
+/// Zero or negative (the broker credits instead) is booked as 1: the broker
+/// then holds that many more permits than this window until a reconnect.
 fn permits_consumed(num_messages_in_batch: Option<i32>) -> i64 {
-    i64::from(num_messages_in_batch.unwrap_or(1)).clamp(1, MAX_PERMITS_PER_ENTRY)
+    i64::from(num_messages_in_batch.unwrap_or(1)).max(1)
 }
 
 /// Whether the permit window has drained far enough to ask for more.
@@ -47,10 +43,12 @@ fn needs_flow(batch_size: u32, remaining: i64) -> bool {
     remaining < (batch_size.div_ceil(2) as i64)
 }
 
-/// The flow request that tops the window back up to `batch_size`,
-/// saturating instead of truncating into a wrapped `u32`.
+/// The flow request that tops the window back up to `batch_size`, at most
+/// `i32::MAX`: the broker reads the uint32 into a Java `int` and rejects a
+/// non-positive one. A deficit past that is granted over further requests.
 fn flow_permits(batch_size: u32, remaining: i64) -> u32 {
-    u32::try_from((i64::from(batch_size) - remaining).max(0)).unwrap_or(u32::MAX)
+    let wanted = (i64::from(batch_size) - remaining).clamp(0, i64::from(i32::MAX));
+    u32::try_from(wanted).unwrap_or(0)
 }
 
 const SYSTEM_PROPERTY_REAL_TOPIC: &str = "REAL_TOPIC";
@@ -207,15 +205,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = -1124, flow message trigger, ask broker to send =>  batch_size - remaining_messages = 2124) [no underflow on remaining messages - with the patch]
             // ```
             if needs_flow(self.batch_size, self.remaining_messages) {
-                match self
-                    .connection
-                    .sender()
-                    .send_flow(
-                        self.id,
-                        flow_permits(self.batch_size, self.remaining_messages),
-                    )
-                    .await
-                {
+                let permits = flow_permits(self.batch_size, self.remaining_messages);
+                match self.connection.sender().send_flow(self.id, permits).await {
                     Ok(()) => {}
                     Err(ConnectionError::Disconnected) => {
                         debug!("consumer engine: consumer connection disconnected, trying to reconnect");
@@ -229,7 +220,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     }
                 }
 
-                self.remaining_messages = self.batch_size as i64;
+                // Mirror the broker: it adds exactly what was granted.
+                self.remaining_messages += i64::from(permits);
             }
 
             match Self::timeout(self.event_rx.next(), Duration::from_secs(1)).await {
@@ -291,6 +283,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         );
                         payload.metadata.num_messages_in_batch
                     }));
+                if let Some(count @ ..=0) = message
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.metadata.num_messages_in_batch)
+                {
+                    warn!(
+                        "{}: entry declares {count} messages; booked as 1 permit until reconnect",
+                        self.debug_format()
+                    );
+                }
 
                 match self.process_message(message).await {
                     // Continue
@@ -733,28 +735,41 @@ impl<Exe: Executor> std::ops::Drop for ConsumerEngine<Exe> {
 mod tests {
     use super::*;
 
-    /// Whatever `num_messages_in_batch` a publisher declares, the window
-    /// still refills within `batch_size` ordinary messages (else the
-    /// consumer stalls until a reconnect) and the flow request stays
-    /// bounded (else the broker may push ~2^31 messages unflowed).
+    /// Models the broker's permit counter beside the engine's window: the
+    /// broker debits the declared count, the engine books the same, and
+    /// every flow the engine sends is added to both. Whatever positive count
+    /// a publisher declares, the two stay equal, every request is a valid
+    /// Java `int` above zero, and the window ends at least half full.
     #[test]
-    fn a_hostile_batch_count_neither_stalls_nor_inflates_the_flow() {
+    fn the_window_mirrors_the_brokers_permits() {
         const BATCH: u32 = 1000;
-        for count in [i32::MIN, -1, 0, i32::MAX] {
-            let mut remaining = BATCH as i64 - permits_consumed(Some(count));
-            let mut flow = None;
-            for _ in 0..=BATCH {
-                if needs_flow(BATCH, remaining) {
-                    flow = Some(flow_permits(BATCH, remaining));
-                    break;
-                }
-                remaining -= permits_consumed(None);
+        for count in [1, 1000, 70_000, i32::MAX] {
+            let mut broker = i64::from(BATCH) - i64::from(count);
+            let mut window = i64::from(BATCH) - permits_consumed(Some(count));
+            let mut flows = 0;
+            while needs_flow(BATCH, window) {
+                let permits = flow_permits(BATCH, window);
+                assert!(
+                    (1..=i32::MAX as u32).contains(&permits),
+                    "{count}: {permits}"
+                );
+                broker += i64::from(permits);
+                window += i64::from(permits);
+                flows += 1;
+                assert!(flows <= 2, "{count}: {flows} flows");
             }
-            let flow = flow.unwrap_or_else(|| panic!("{count}: no flow request: a stall"));
-            assert!(
-                (1..=2 * BATCH + MAX_PERMITS_PER_ENTRY as u32).contains(&flow),
-                "{count}: {flow}"
-            );
+            assert_eq!(window, broker, "{count}");
+            assert!(window >= i64::from(BATCH.div_ceil(2)), "{count}: {window}");
         }
+    }
+
+    /// A declared count of zero or less is booked as one permit, so the
+    /// window still drains and refills.
+    #[test]
+    fn a_non_positive_count_is_booked_as_one_permit() {
+        for count in [0, -1, i32::MIN] {
+            assert_eq!(permits_consumed(Some(count)), 1, "{count}");
+        }
+        assert_eq!(permits_consumed(None), 1);
     }
 }
