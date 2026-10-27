@@ -1304,6 +1304,43 @@ mod tests {
         }
     }
 
+    /// Waits until the broker reports a connected consumer on `subscription` again, after a topic
+    /// unload made the client reconnect. Fails the test after 30 s.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn wait_for_connected_consumer(topic: &str, subscription: &str) {
+        let url = format!("http://127.0.0.1:8080/admin/v2/persistent/public/default/{topic}/stats");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let connected = match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| {
+                        v.get("subscriptions")?
+                            .get(subscription)?
+                            .get("consumers")?
+                            .as_array()
+                            .map(|c| !c.is_empty())
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if connected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no consumer reconnected to {subscription} on {topic} after the unload"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     #[cfg(any(
         feature = "tokio-runtime",
@@ -1370,6 +1407,15 @@ mod tests {
         }
         log::info!("first loop, received {} messages, so break", consumed_1);
 
+        // `ack` only queues the ack; the broker applies it and persists the new mark-delete
+        // position asynchronously. A seek that reaches the broker while that persist is still in
+        // flight is dropped by the managed cursor ("Skipping mark delete update, in-progress
+        // position is later") and the late persist re-marks 0-49 as acked, so they are never
+        // redelivered. Unloading the topic closes the cursor, which waits for pending
+        // mark-delete writes and persists the position, so nothing is in flight at the seek.
+        crate::test_utils::unload_topic("public", "default", &topic).await;
+        wait_for_connected_consumer(&topic, "seek_single_test").await;
+
         // // call seek(timestamp), roll back the consumer to start_time
         log::info!("calling seek method");
         // Seek in a separate task, to verify that the seek future is `Send`. See #255.
@@ -1394,14 +1440,16 @@ mod tests {
         // then read the messages again
         log::info!("reading messages again");
 
+        let mut seen_2 = std::collections::BTreeSet::new();
         let mut consumed_2 = 0_u32;
 
-        while consumed_2 < msg_count {
+        while (seen_2.len() as u32) < msg_count {
             let msg = recv_within(&mut consumer_1, DEFAULT_RECV_TIMEOUT)
                 .await
                 .expect("second loop failed to receive after seek");
             let publish_time = msg.metadata().publish_time;
             let data = msg.deserialize().expect("deserialize");
+            seen_2.insert(data.clone());
             log::info!(
                 "second loop, got {} messages, content: {}, publish time: {}",
                 consumed_2 + 1,
@@ -1414,8 +1462,13 @@ mod tests {
         log::info!("received {} messages in second loop, so break", consumed_2);
 
         // then check if all messages were received
+        // Redelivery is at-least-once: copies prefetched before the unload may repeat, but every
+        // message, including the acked 0-49, must come back after the seek.
         assert_eq!(50, consumed_1);
-        assert_eq!(100, consumed_2);
+        assert!(consumed_2 >= msg_count);
+        let expected: std::collections::BTreeSet<String> =
+            (0..msg_count).map(|i| i.to_string()).collect();
+        assert_eq!(expected, seen_2);
     }
 
     #[tokio::test]
