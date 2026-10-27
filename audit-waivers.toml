@@ -1,0 +1,8 @@
+# cargo-audit waivers: THE HUMAN HALF. One entry per id silenced in
+# `.cargo/audit.toml`, stating which advisory, why it is tolerable, and until
+# when. Shape (all three keys mandatory; at most 366 days out):
+#
+#   [[waiver]]
+#   id = "RUSTSEC-YYYY-NNNN"
+#   reason = "Why this is tolerable here, and what closes it."
+#   expires = "YYYY-MM-DD"
