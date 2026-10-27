@@ -63,7 +63,9 @@ items.
   unacknowledged and schedules no resubscribe (which would redeliver, refuse
   and resubscribe in a loop); a failed ack schedules none either. The ack
   and the resubscribe's `CloseConsumer` go out in that order on the same
-  connection. **Shared** is unchanged: the broker skips such an entry, which
+  connection. Like any reconnect, the resubscribe redelivers what is
+  unacknowledged at that moment, including messages whose ack the engine
+  had not sent yet (at-least-once). **Shared** is unchanged: the broker skips such an entry, which
   no client-side change can repair (the producer-trust statement under .8
   stands).
 - **Receive queue**: each item is measured once, on send, and the receiver

@@ -1951,6 +1951,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let before = crate::test_utils::consumer_stats_when(&topic, "declared", |_| true).await;
 
         let mut table = Vec::new();
         crate::message::BatchedMessage {
@@ -1978,6 +1979,15 @@ mod tests {
             .expect("stream open");
         if let Ok(message) = &first {
             consumer.ack(message).await.unwrap();
+        }
+        // A forced resubscribe redelivers whatever is unacknowledged at that
+        // moment (at-least-once, as any reconnect); wait for it, so the
+        // ordinary messages below arrive exactly once and in order.
+        if count <= 0 && sub_type != SubType::Shared {
+            crate::test_utils::consumer_stats_when(&topic, "declared", |c| {
+                c["connectedSince"] != before["connectedSince"]
+            })
+            .await;
         }
 
         for i in 0..2 * BATCH {
