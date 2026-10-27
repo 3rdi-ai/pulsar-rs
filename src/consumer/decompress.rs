@@ -3,9 +3,15 @@
 //! (a decompression bomb). A message that would decompress past `limit`, or
 //! whose output does not match its declared `uncompressed_size`, is refused
 //! with a [`DecodeRefusal`] — a per-message error, never a panic and never
-//! an unbounded allocation. A batch is likewise bounded: past
-//! `max_members` members, or when its members' copies of the envelope
-//! metadata would exceed `limit`, it is refused before it is split.
+//! an unbounded allocation.
+//!
+//! A batch is bounded before it is decompressed or split: past
+//! `max_members` members, or when its members' copies of the envelope would
+//! cost more than `limit` (each member copies the envelope minus the fields
+//! it replaces, plus a `Metadata` and a `MessageIdData`), it is refused. So
+//! one message peaks at about its received bytes plus three times `limit`:
+//! the decompressed table, the members' own metadata and payloads cut from
+//! it, and the envelope copies.
 
 use crate::{
     consumer::batched_message_iterator::BatchedMessageIterator,
@@ -17,11 +23,42 @@ use crate::{
 /// Pulsar's default broker `maxMessageSize` (5 MiB).
 pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 5 * 1024 * 1024;
 
-/// The default most members one batch may declare: ten times the member
-/// cap Pulsar producers default to (`batchingMaxMessages`, 1000), so no
-/// real batch is refused, while one batch can still only materialise a
-/// bounded number of payloads.
-pub const DEFAULT_MAX_BATCH_MEMBERS: u32 = 10_000;
+/// The default most members one batch may declare: five times the member
+/// cap Pulsar producers default to (`batchingMaxMessages`, 1000). At the
+/// default `max_decompressed_size` a full batch of this many members still
+/// fits the envelope-copy bound (about 500 bytes of per-member structs plus
+/// a few hundred bytes of copied envelope each).
+pub const DEFAULT_MAX_BATCH_MEMBERS: u32 = 5_000;
+
+/// The fixed in-memory cost of one batch member beyond its copied envelope.
+const MEMBER_OVERHEAD: usize =
+    std::mem::size_of::<crate::message::Metadata>() + std::mem::size_of::<proto::MessageIdData>();
+
+/// The envelope fields every batch member replaces with its own: held
+/// aside so they are neither measured nor copied per member, and put back
+/// when the message is refused (it is settled as it arrived).
+struct MemberOwned {
+    properties: Vec<proto::KeyValue>,
+    partition_key: Option<String>,
+    ordering_key: Option<Vec<u8>>,
+}
+
+impl MemberOwned {
+    fn take(metadata: &mut crate::message::Metadata) -> Self {
+        Self {
+            properties: std::mem::take(&mut metadata.properties),
+            partition_key: metadata.partition_key.take(),
+            ordering_key: metadata.ordering_key.take(),
+        }
+    }
+
+    fn restore(self, mut metadata: crate::message::Metadata) -> crate::message::Metadata {
+        metadata.properties = self.properties;
+        metadata.partition_key = self.partition_key;
+        metadata.ordering_key = self.ordering_key;
+        metadata
+    }
+}
 
 fn undecodable(e: impl std::fmt::Display) -> DecodeRefusal {
     DecodeRefusal::Undecodable(e.to_string())
@@ -72,28 +109,21 @@ pub(crate) fn decode_payload(
             }
         },
     };
-    let decompressed = if compression == proto::CompressionType::None {
-        None
-    } else {
-        match decompress(
-            compression,
-            &payload.data,
-            payload.metadata.uncompressed_size,
-            limit,
-        ) {
-            Ok(data) => Some(data),
-            Err(reason) => return Err(Box::new((payload, reason))),
-        }
-    };
     let Some(count) = payload.metadata.num_messages_in_batch else {
-        let payload = match decompressed {
-            Some(data) => Payload {
-                data,
-                metadata: payload.metadata,
-            },
-            None => payload,
+        if compression == proto::CompressionType::None {
+            return Ok(vec![(message_id, payload)]);
+        }
+        let declared = payload.metadata.uncompressed_size;
+        return match decompress(compression, &payload.data, declared, limit) {
+            Ok(data) => Ok(vec![(
+                message_id,
+                Payload {
+                    data,
+                    metadata: payload.metadata,
+                },
+            )]),
+            Err(reason) => Err(Box::new((payload, reason))),
         };
-        return Ok(vec![(message_id, payload)]);
     };
     // A batch of no members would deliver nothing, so the message would be
     // neither acknowledged nor refused and hold a permit forever.
@@ -101,31 +131,48 @@ pub(crate) fn decode_payload(
         let reason = undecodable(format!("batch declares {count} messages"));
         return Err(Box::new((payload, reason)));
     };
+    // The batch bounds need only the metadata, so they run before anything
+    // is decompressed.
     if count > max_members {
         let reason = undecodable(format!(
             "batch declares {count} messages, past the {max_members}-member cap"
         ));
         return Err(Box::new((payload, reason)));
     }
-    // Every member carries a copy of the envelope metadata, which the
-    // frame alone bounds only to megabytes: the copies, not the member
-    // table, are what a small batch would amplify into an OOM.
-    let envelope = prost::Message::encoded_len(&payload.metadata);
-    if (count as usize).saturating_mul(envelope) > limit {
+    let Payload { data, mut metadata } = payload;
+    let owned = MemberOwned::take(&mut metadata);
+    // Every member copies what is left of the envelope, which the frame
+    // alone bounds only to megabytes: the copies, not the member table, are
+    // what a small batch would amplify into an OOM.
+    let per_member = prost::Message::encoded_len(&metadata) + MEMBER_OVERHEAD;
+    if (count as usize).saturating_mul(per_member) > limit {
         let reason = undecodable(format!(
-            "batch of {count} messages would copy its {envelope}-byte envelope past the {limit}-byte cap"
+            "batch of {count} messages would copy {per_member} bytes each past the {limit}-byte cap"
         ));
-        return Err(Box::new((payload, reason)));
+        let metadata = owned.restore(metadata);
+        return Err(Box::new((Payload { data, metadata }, reason)));
     }
-    let table = decompressed.as_deref().unwrap_or(&payload.data);
-    match parse_batched_message(count, table) {
-        Ok(members) => {
-            Ok(
-                BatchedMessageIterator::from_members(message_id, payload.metadata, count, members)
-                    .collect(),
-            )
+    let decompressed = if compression == proto::CompressionType::None {
+        None
+    } else {
+        match decompress(compression, &data, metadata.uncompressed_size, limit) {
+            Ok(table) => Some(table),
+            Err(reason) => {
+                let metadata = owned.restore(metadata);
+                return Err(Box::new((Payload { data, metadata }, reason)));
+            }
         }
-        Err(err) => Err(Box::new((payload, undecodable(err)))),
+    };
+    let table = decompressed.as_deref().unwrap_or(&data);
+    match parse_batched_message(count, table) {
+        Ok(members) => Ok(BatchedMessageIterator::from_members(
+            message_id, metadata, count, members,
+        )
+        .collect()),
+        Err(err) => {
+            let metadata = owned.restore(metadata);
+            Err(Box::new((Payload { data, metadata }, undecodable(err))))
+        }
     }
 }
 
@@ -617,69 +664,153 @@ mod tests {
     }
 
     /// An uncompressed batch of `count` empty members (4 bytes each: a zero
-    /// `metadata_size`) under an envelope carrying a property of
-    /// `envelope_bytes`.
-    fn empty_members(count: usize, envelope_bytes: usize) -> crate::Payload {
-        let mut payload = batch_payload(vec![0u8; 4 * count], None, None, count as i32);
-        payload.metadata.properties.push(proto::KeyValue {
-            key: "k".into(),
-            value: "v".repeat(envelope_bytes),
-        });
-        payload
+    /// `metadata_size`) under a plain envelope.
+    fn empty_members(count: usize) -> crate::Payload {
+        batch_payload(vec![0u8; 4 * count], None, None, count as i32)
     }
 
-    /// A 64 KiB envelope over 2000 empty members would clone 128 MiB of
+    /// A 64 KiB `replicate_to` and 64 KiB of `encryption_keys` (fields every
+    /// member copies) over 2000 empty members would clone 256 MiB of
     /// metadata out of an 8000-byte table: refused, with the bytes.
     #[test]
     fn an_envelope_amplified_by_many_members_is_refused() {
-        let payload = empty_members(2000, 64 * 1024);
+        let mut payload = empty_members(2000);
+        payload.metadata.replicate_to.push("r".repeat(64 * 1024));
+        payload
+            .metadata
+            .encryption_keys
+            .push(proto::EncryptionKeys {
+                key: "k".into(),
+                value: vec![7u8; 64 * 1024],
+                ..Default::default()
+            });
         let data = payload.data.clone();
-        let (back, reason) = *decode_payload(
-            Default::default(),
-            payload,
-            LIMIT,
-            DEFAULT_MAX_BATCH_MEMBERS,
-        )
-        .unwrap_err();
+        let (back, reason) =
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
         );
         assert_eq!(back.data, data);
+        assert_eq!(back.metadata.replicate_to.len(), 1, "refused as it arrived");
     }
 
-    /// More members than the 10_000 default cap, however small the
-    /// envelope: refused, with the bytes.
+    /// Envelope properties are not copied to members (each member carries
+    /// its own), so a 64 KiB-properties envelope over 2000 members decodes
+    /// at the default cap.
     #[test]
-    fn a_batch_past_the_member_cap_is_refused() {
-        let payload = empty_members(10_001, 0);
-        let data = payload.data.clone();
-        let (back, reason) = *decode_payload(
-            Default::default(),
-            payload,
-            LIMIT,
-            DEFAULT_MAX_BATCH_MEMBERS,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(reason, DecodeRefusal::Undecodable(_)),
-            "{reason:?}"
-        );
-        assert_eq!(back.data, data);
-    }
-
-    /// Exactly the default cap of members decodes, one payload each.
-    #[test]
-    fn a_batch_at_the_member_cap_decodes() {
-        let payload = empty_members(10_000, 0);
+    fn a_large_properties_envelope_over_many_members_decodes() {
+        let mut payload = empty_members(2000);
+        payload.metadata.properties.push(proto::KeyValue {
+            key: "k".into(),
+            value: "v".repeat(64 * 1024),
+        });
         let members = decode_payload(
             Default::default(),
             payload,
-            LIMIT,
-            DEFAULT_MAX_BATCH_MEMBERS,
+            DEFAULT_MAX_DECOMPRESSED_SIZE,
+            MEMBERS,
         )
         .unwrap();
-        assert_eq!(members.len(), 10_000);
+        assert_eq!(members.len(), 2000);
+        assert!(members
+            .iter()
+            .all(|(_, p)| p.metadata.properties.is_empty()));
+    }
+
+    /// More members than the default cap, however small the envelope:
+    /// refused, with the bytes.
+    #[test]
+    fn a_batch_past_the_member_cap_is_refused() {
+        let payload = empty_members(MEMBERS as usize + 1);
+        let data = payload.data.clone();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            DEFAULT_MAX_DECOMPRESSED_SIZE,
+            MEMBERS,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason, DecodeRefusal::Undecodable(_)),
+            "{reason:?}"
+        );
+        assert_eq!(back.data, data);
+    }
+
+    /// The bounds need only the metadata, so they refuse BEFORE anything is
+    /// decompressed: a zstd batch past the cap whose bytes are not zstd at
+    /// all is refused for its member count, not for its codec.
+    #[test]
+    fn the_member_cap_is_checked_before_decompression() {
+        let payload = batch_payload(
+            vec![0xffu8; 64],
+            Some(proto::CompressionType::Zstd),
+            Some(64),
+            MEMBERS as i32 + 1,
+        );
+        let (_, reason) = *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
+        assert!(reason.to_string().contains("member cap"), "{reason}");
+    }
+
+    /// At the defaults, a full batch of the default member cap decodes.
+    #[test]
+    fn a_batch_at_the_member_cap_decodes() {
+        let payload = empty_members(MEMBERS as usize);
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            DEFAULT_MAX_DECOMPRESSED_SIZE,
+            MEMBERS,
+        )
+        .unwrap();
+        assert_eq!(members.len(), MEMBERS as usize);
+    }
+
+    /// Members keep their own properties and keys, never the envelope's,
+    /// and an empty member stays empty.
+    #[test]
+    fn members_keep_their_own_properties_and_keys() {
+        use crate::message::{proto::SingleMessageMetadata, BatchedMessage};
+        let mut table = Vec::new();
+        BatchedMessage {
+            metadata: SingleMessageMetadata {
+                properties: vec![proto::KeyValue {
+                    key: "own".into(),
+                    value: "1".into(),
+                }],
+                partition_key: Some("k1".into()),
+                ordering_key: Some(b"o1".to_vec()),
+                payload_size: 3,
+                ..Default::default()
+            },
+            payload: b"one".to_vec(),
+        }
+        .serialize(&mut table);
+        BatchedMessage {
+            metadata: SingleMessageMetadata::default(),
+            payload: Vec::new(),
+        }
+        .serialize(&mut table);
+        let mut payload = batch_payload(table, None, None, 2);
+        payload.metadata.properties.push(proto::KeyValue {
+            key: "envelope".into(),
+            value: "x".into(),
+        });
+        payload.metadata.partition_key = Some("envelope-key".into());
+        payload.metadata.ordering_key = Some(b"envelope-order".to_vec());
+        let members = decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap();
+        assert_eq!(members.len(), 2);
+        let first = &members[0].1.metadata;
+        assert_eq!(first.properties.len(), 1);
+        assert_eq!(first.properties[0].key, "own");
+        assert_eq!(first.partition_key.as_deref(), Some("k1"));
+        assert_eq!(first.ordering_key.as_deref(), Some(&b"o1"[..]));
+        let empty = &members[1].1;
+        assert!(empty.metadata.properties.is_empty());
+        assert_eq!(empty.metadata.partition_key, None);
+        assert_eq!(empty.metadata.ordering_key, None);
+        assert!(empty.data.is_empty());
     }
 
     /// Bytes left after the declared members mean the table is not what

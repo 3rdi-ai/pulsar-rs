@@ -40,9 +40,13 @@ pub struct ConsumerOptions {
     /// Raise it on purpose for a topic with large legitimate messages.
     pub max_decompressed_size: Option<usize>,
     /// The most members one batch may declare; `None` means
-    /// [`crate::consumer::DEFAULT_MAX_BATCH_MEMBERS`] (10_000, ten times
+    /// [`crate::consumer::DEFAULT_MAX_BATCH_MEMBERS`] (5_000, five times
     /// the producers' default batch). A batch past it is refused and
-    /// settled like any undecodable message.
+    /// settled like any undecodable message. A second bound applies with
+    /// it: the members' copies of the envelope (about 500 bytes each plus
+    /// the envelope's copied fields) must fit `max_decompressed_size`, so
+    /// raising this cap past `max_decompressed_size / 1 KiB` or so needs
+    /// that cap raised too.
     pub max_batch_members: Option<u32>,
 }
 
