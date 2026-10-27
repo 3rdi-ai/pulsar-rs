@@ -45,6 +45,12 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
+    /// The byte budget of this consumer's receive queue.
+    #[cfg(test)]
+    pub(crate) fn queue_max_bytes(&self) -> usize {
+        self.messages.max_bytes()
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub(super) async fn new(
         client: Pulsar<Exe>,

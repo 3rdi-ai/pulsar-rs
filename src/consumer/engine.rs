@@ -33,9 +33,10 @@ use crate::{
 /// debits them: the declared `num_messages_in_batch`, unclamped
 /// (`AbstractBaseDispatcher` sums it, `Consumer.sendMessages` subtracts
 /// it), so the window mirrors the broker's and the next flow re-grants it.
-/// Zero or negative (the broker credits instead, and `i32::MIN` overflows
-/// its window negative) is booked as 1, and the engine then resubscribes,
-/// which resets the broker's permits to this window's.
+/// Zero or negative is booked as 1. The broker's window then drifts from
+/// this one (a single-active-consumer dispatcher credits a negative count,
+/// and `i32::MIN` overflows it), which no client booking repairs: the
+/// publisher trust boundary (mesh + publish authorization) is the defence.
 fn permits_consumed(num_messages_in_batch: Option<i32>) -> i64 {
     i64::from(num_messages_in_batch.unwrap_or(1)).max(1)
 }
@@ -51,6 +52,16 @@ fn needs_flow(batch_size: u32, remaining: i64) -> bool {
 fn flow_permits(batch_size: u32, remaining: i64) -> u32 {
     let wanted = (i64::from(batch_size) - remaining).clamp(0, i64::from(i32::MAX));
     u32::try_from(wanted).unwrap_or(0)
+}
+
+/// The least time between two warnings about entries declaring zero or
+/// fewer members, so a hostile publisher cannot flood the log.
+const NON_POSITIVE_COUNT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a non-positive-count warning is due at `now`, given when the
+/// last one was logged.
+fn warn_due(last: Option<Instant>, now: Instant) -> bool {
+    !matches!(last, Some(last) if now.saturating_duration_since(last) < NON_POSITIVE_COUNT_WARN_INTERVAL)
 }
 
 const SYSTEM_PROPERTY_REAL_TOPIC: &str = "REAL_TOPIC";
@@ -80,6 +91,8 @@ pub struct ConsumerEngine<Exe: Executor> {
     event_tx: UnboundedSender<EngineEvent<Exe>>,
     batch_size: u32,
     remaining_messages: i64,
+    /// When the last non-positive-count warning was logged.
+    non_positive_count_warned: Option<Instant>,
     unacked_message_redelivery_delay: Option<Duration>,
     unacked_messages: HashMap<MessageIdData, Instant>,
     dead_letter_policy: Option<DeadLetterPolicy>,
@@ -120,6 +133,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             event_tx,
             batch_size,
             remaining_messages: batch_size as i64,
+            non_positive_count_warned: None,
             unacked_message_redelivery_delay,
             unacked_messages: HashMap::new(),
             dead_letter_policy,
@@ -286,17 +300,25 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         payload.metadata.num_messages_in_batch
                     }));
                 // A count of zero or less is refused (and acknowledged) like
-                // any undecodable batch, but the broker has already credited
-                // permits for it, so the consumer then resubscribes:
-                // CloseConsumer and a fresh subscribe reset the broker's
-                // window.
-                let forged = message
+                // any undecodable batch; it is also logged, at most once per
+                // interval.
+                if let Some(count @ ..=0) = message
                     .payload
                     .as_ref()
                     .and_then(|p| p.metadata.num_messages_in_batch)
-                    .filter(|count| *count <= 0);
+                {
+                    let now = Instant::now();
+                    if warn_due(self.non_positive_count_warned, now) {
+                        self.non_positive_count_warned = Some(now);
+                        warn!(
+                            "{}: entry declares {count} messages; booked as 1 permit (further such entries are not logged for {:?})",
+                            self.debug_format(),
+                            NON_POSITIVE_COUNT_WARN_INTERVAL
+                        );
+                    }
+                }
 
-                let outcome = match self.process_message(message).await {
+                match self.process_message(message).await {
                     // Continue
                     Ok(true) => None,
                     // End of Topic
@@ -309,17 +331,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                             None
                         }
                     }
-                };
-                if let (Some(count), None) = (forged, &outcome) {
-                    warn!(
-                        "{}: entry declares {count} messages; resubscribing to reset the broker's permits",
-                        self.debug_format()
-                    );
-                    if let Err(e) = self.reconnect().await {
-                        return Some(Err(e));
-                    }
                 }
-                outcome
             }
         }
     }
@@ -498,10 +510,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .options
             .max_batch_members
             .unwrap_or(super::decompress::DEFAULT_MAX_BATCH_MEMBERS);
-        let max_envelope = self
-            .options
-            .max_batch_envelope_bytes
-            .unwrap_or(super::DEFAULT_MAX_QUEUED_BYTES);
+        let max_envelope = super::decompress::envelope_bound(self.options.max_batch_envelope_bytes);
         let id = message.message_id.clone();
         let payloads = match super::decompress::decode_payload(
             id,
@@ -797,5 +806,20 @@ mod tests {
             assert_eq!(permits_consumed(Some(count)), 1, "{count}");
         }
         assert_eq!(permits_consumed(None), 1);
+    }
+
+    /// The first non-positive-count entry is logged, the next ones only
+    /// once the interval has passed: one line per interval, not per entry.
+    #[test]
+    fn non_positive_count_warnings_are_rate_limited() {
+        let t0 = Instant::now();
+        assert!(warn_due(None, t0), "the first is logged");
+        assert!(!warn_due(Some(t0), t0), "an immediate repeat is not");
+        let almost = t0 + NON_POSITIVE_COUNT_WARN_INTERVAL - Duration::from_millis(1);
+        assert!(!warn_due(Some(t0), almost), "nor one inside the interval");
+        assert!(
+            warn_due(Some(t0), t0 + NON_POSITIVE_COUNT_WARN_INTERVAL),
+            "one at the interval is"
+        );
     }
 }

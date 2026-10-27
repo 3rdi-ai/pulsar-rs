@@ -22,7 +22,10 @@ use std::{
 pub use builder::ConsumerBuilder;
 use chrono::{DateTime, Utc};
 pub use data::{DeadLetterPolicy, EngineMessage};
-pub use decompress::{DEFAULT_MAX_BATCH_MEMBERS, DEFAULT_MAX_DECOMPRESSED_SIZE};
+pub use decompress::{
+    DEFAULT_MAX_BATCH_ENVELOPE_BYTES, DEFAULT_MAX_BATCH_MEMBERS, DEFAULT_MAX_DECOMPRESSED_SIZE,
+    MIN_MAX_BATCH_ENVELOPE_BYTES,
+};
 use futures::{
     future::try_join_all,
     task::{Context, Poll},
@@ -2004,18 +2007,81 @@ mod tests {
         ordinary_messages_flow_after_a_declared_count(70_000, SubType::Shared).await;
     }
 
-    /// A negative count makes the single-active-consumer dispatcher CREDIT
-    /// permits; `i32::MIN` overflows its window negative, so only a
-    /// resubscribe recovers it. (A Shared subscription's dispatcher never
-    /// sends such an entry at all: it stalls broker-side, out of reach.)
+    /// A negative count is refused and acknowledged, and on an Exclusive
+    /// subscription (whose dispatcher credits the broker window instead of
+    /// debiting it) ordinary messages keep flowing. Larger negative counts
+    /// (`i32::MIN`) can still stall the broker's window: a producer-trust
+    /// limit, documented in FORK.md.
     #[tokio::test]
     async fn a_batch_declaring_minus_one_members_does_not_stall_dispatch() {
         ordinary_messages_flow_after_a_declared_count(-1, SubType::Exclusive).await;
     }
 
+    /// A batch whose members' envelope copies pass a configured
+    /// `max_batch_envelope_bytes` is refused: the option reaches the engine.
     #[tokio::test]
-    async fn a_batch_declaring_i32_min_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive).await;
+    async fn a_configured_envelope_bound_refuses_a_batch_past_it() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("envelope_bound_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = client.producer().with_topic(&topic).build().await.unwrap();
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("envelope")
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                max_batch_envelope_bytes: Some(MIN_MAX_BATCH_ENVELOPE_BYTES),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        // 500 empty members (a zero metadata size each): about 300 KB of
+        // envelope copies, past the 64 KiB bound and far under the default.
+        const MEMBERS: i32 = 500;
+        producer
+            .send_forged(producer::ProducerMessage {
+                payload: vec![0u8; 4 * MEMBERS as usize],
+                num_messages_in_batch: Some(MEMBERS),
+                ..Default::default()
+            })
+            .await
+            .await
+            .unwrap();
+        let first = timeout(DEFAULT_RECV_TIMEOUT, consumer.next())
+            .await
+            .expect("the batch must surface")
+            .expect("stream open");
+        assert!(
+            matches!(first, Err(Error::Consumer(ConsumerError::Refused { .. }))),
+            "{:?}",
+            first.map(|m| m.payload.data.len())
+        );
+    }
+
+    /// A configured `max_queued_bytes` reaches the consumer's receive queue.
+    #[tokio::test]
+    async fn a_configured_queue_budget_reaches_the_receive_queue() {
+        const BUDGET: usize = 12_345;
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("queue_budget_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("budget")
+            .with_options(ConsumerOptions::default().with_max_queued_bytes(BUDGET))
+            .build()
+            .await
+            .unwrap();
+        match &consumer.inner {
+            InnerConsumer::Single(c) => assert_eq!(c.queue_max_bytes(), BUDGET),
+            _ => panic!("one topic builds a single consumer"),
+        }
     }
 
     /// Decodes to 8 MiB of zeros: past the 5 MiB default cap, tiny on the wire.

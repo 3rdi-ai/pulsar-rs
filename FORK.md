@@ -8,8 +8,9 @@ licensed as upstream (MIT OR Apache-2.0; see `LICENSE-APACHE`, `LICENSE-MIT`, `C
 Upstream `pulsar` 6.9.1 (the latest release) requires `zstd ^0.13.2` under its
 `compression` feature. zstd 0.13 / zstd-safe 7 / zstd-sys < 2.1.2 carry
 RUSTSEC-2026-0391, -0398, -0403 and -0410 (among others), fixed only on
-zstd >= 0.14.3. This fork changes exactly one thing: `zstd = "^0.14.3"`
-(plus a zstd round-trip test). No API or behaviour change.
+zstd >= 0.14.3. The fork began as that one change (`zstd = "^0.14.3"`, plus
+a zstd round-trip test) and has since gained consume-path hardening, with
+additive API and changed behaviour, listed per release below.
 
 Since `v6.9.1-3rdi.2` the fork also **bounds decompression on the consume
 path** (`src/consumer/decompress.rs`). Upstream decodes zlib/zstd/snappy to
@@ -41,14 +42,20 @@ messages can raise it on purpose.
 Supersedes `v6.9.1-3rdi.7` (left in place, not deleted). Fixes from the
 security review of .7:
 
-- **New public item** (additive): `ConsumerOptions::max_batch_envelope_bytes`
-  / `with_max_batch_envelope_bytes`, default `DEFAULT_MAX_QUEUED_BYTES`
-  (64 MiB). The members' envelope copies are bounded by THIS, no longer by
-  `max_decompressed_size`, so the two caps no longer interact: an honest
-  end-to-end-encrypted batch of 5000 members carrying RSA-4096-wrapped data
-  keys is accepted at the defaults (under .7 it was refused). Peak memory per
-  message is the received bytes plus about twice `max_decompressed_size` plus
-  `max_batch_envelope_bytes`.
+- **New public items** (additive): `ConsumerOptions::max_batch_envelope_bytes`
+  / `with_max_batch_envelope_bytes`, default `DEFAULT_MAX_BATCH_ENVELOPE_BYTES`
+  (64 MiB, the same value as the queue budget but its own knob); a setting
+  below `MIN_MAX_BATCH_ENVELOPE_BYTES` (64 KiB; 0 would refuse every batch)
+  is raised to it. The members' envelope copies are bounded by THIS, no
+  longer by `max_decompressed_size`, so the two caps no longer interact: an
+  honest end-to-end-encrypted batch of 5000 members carrying RSA-4096-wrapped
+  data keys is accepted at the defaults (under .7 it was refused). Measured
+  peak memory per message: the received bytes, plus `max_decompressed_size`
+  (the decompressed table), plus about 8x `max_decompressed_size` (the
+  members' own metadata and payloads cut from it, as allocated), plus
+  `max_batch_envelope_bytes` of envelope copies.
+  `max_queued_bytes = 0` does not deadlock (an empty queue admits one
+  payload), so it is documented, not clamped.
 - **Structural measure**: a metadata's cost is its encoded length plus the
   in-memory struct of every repeated element (`properties`, `replicate_to`,
   `encryption_keys` and each key's own `metadata`). `encoded_len` alone
@@ -61,15 +68,24 @@ security review of .7:
   whose send fails, so the engine stops and sends `CloseConsumer` (before
   this it parked forever and the broker kept a zombie consumer).
 - **Non-positive batch counts**: an entry declaring zero or fewer members is
-  still refused and acknowledged, and the consumer then **resubscribes**
-  (CloseConsumer + subscribe), which resets the broker's permits: the
-  single-active-consumer dispatcher (Exclusive/Failover) credits permits on
-  a negative count, and `i32::MIN` overflowed its window and stalled the
-  subscription for good. One `warn!` per resubscribe. A **Shared**
-  subscription's dispatcher never sends such an entry at all (it computes
-  a non-positive message count and skips it), and the subscription stalls
-  for good BROKER-side: against a 5.0.0 standalone broker, no later honest
-  message was delivered. No client change reaches that.
+  refused and acknowledged (as in .7), booked as one permit, and logged at
+  most once a minute per consumer (no per-message flood).
+  **Producer-trust limit**: a forged count still corrupts the BROKER's permit
+  window, which no client booking repairs. On Exclusive/Failover the
+  single-active-consumer dispatcher credits a negative count (over-granting)
+  and `i32::MIN` overflows its window, stalling the subscription. On
+  **Shared** (the default for `prophesee-service-rs` consumers) the entry is
+  never delivered and no later message was either, against a 5.0.0
+  standalone broker; that the dispatcher skips an entry whose message count
+  is not positive is INFERRED from that behaviour, not read from the broker
+  source. The defence is the publisher trust boundary: the mesh plus Pulsar
+  publish authorization.
+- **Planned follow-ups** (a separate branch after .8): client-side recovery
+  for the Exclusive/Failover case (resubscribe with backoff, only after the
+  refusal's ack succeeds), with a session generation that drops stale
+  messages from a previous subscription (which also fixes the pre-existing
+  window drift after a connection error); and measuring each queued item
+  once instead of on admit and on release.
 
 ## v6.9.1-3rdi.7
 

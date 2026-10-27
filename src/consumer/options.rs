@@ -50,14 +50,17 @@ pub struct ConsumerOptions {
     /// taken; `None` means [`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`]
     /// (64 MiB). The engine waits (it stops reading this consumer's
     /// messages) rather than queue a payload past it; an empty queue always
-    /// takes one payload, so one larger than the budget is still delivered.
+    /// takes one payload, so one larger than the budget is still delivered
+    /// (and 0 does not deadlock: it queues one payload at a time).
     /// `receiver_queue_size` bounds the count of queued messages, this
     /// bounds their bytes: whichever is reached first holds the engine.
     pub max_queued_bytes: Option<usize>,
     /// The most bytes one batch's members may spend copying the envelope
     /// (each member clones the envelope's metadata, measured structurally,
     /// plus about 500 bytes of per-member structs); `None` means
-    /// [`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`] (64 MiB). A batch past
+    /// [`crate::consumer::DEFAULT_MAX_BATCH_ENVELOPE_BYTES`] (64 MiB), and a
+    /// setting below [`crate::consumer::MIN_MAX_BATCH_ENVELOPE_BYTES`]
+    /// (64 KiB; 0 would refuse every batch) is raised to it. A batch past
     /// it is refused and settled like any undecodable message. It is its
     /// own bound, not `max_decompressed_size`, so an end-to-end-encrypted
     /// batch of thousands of members (each copying the wrapped data keys)
@@ -91,7 +94,8 @@ impl ConsumerOptions {
     }
 
     /// within options, sets the most bytes one batch's members may spend
-    /// copying the envelope (see
+    /// copying the envelope, never below
+    /// [`crate::consumer::MIN_MAX_BATCH_ENVELOPE_BYTES`] (see
     /// [`ConsumerOptions::max_batch_envelope_bytes`])
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_max_batch_envelope_bytes(mut self, bytes: usize) -> Self {

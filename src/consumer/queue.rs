@@ -56,7 +56,7 @@ impl Budget {
     fn poll_reserve(&self, bytes: usize, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.lock();
         if state.closed || state.queued == 0 || state.queued.saturating_add(bytes) <= self.max {
-            state.queued += bytes;
+            state.queued = state.queued.saturating_add(bytes);
             Poll::Ready(())
         } else {
             state.waiter = Some(cx.waker().clone());
@@ -140,6 +140,12 @@ impl QueueReceiver {
     pub(crate) fn queued_bytes(&self) -> usize {
         self.budget.lock().queued
     }
+
+    /// The byte budget this queue was built with.
+    #[cfg(test)]
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.budget.max
+    }
 }
 
 impl Drop for QueueReceiver {
@@ -164,7 +170,9 @@ impl Stream for QueueReceiver {
 }
 
 /// A queue of at most `capacity` items (as `mpsc::channel`) and, past the
-/// first, at most `max_bytes` of decoded payload.
+/// first, at most `max_bytes` of decoded payload. A `max_bytes` of 0 does
+/// not deadlock: an empty queue always admits one item, so it holds one
+/// item at a time.
 pub(crate) fn receive_queue(capacity: usize, max_bytes: usize) -> (QueueSender, QueueReceiver) {
     let (tx, rx) = mpsc::channel(capacity);
     let budget = Arc::new(Budget {

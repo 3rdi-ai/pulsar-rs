@@ -27,10 +27,27 @@ pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 5 * 1024 * 1024;
 /// The default most members one batch may declare: five times the member
 /// cap Pulsar producers default to (`batchingMaxMessages`, 1000). A full
 /// batch of this many members fits the default envelope-copy bound
-/// ([`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`], 64 MiB) with up to about
+/// ([`DEFAULT_MAX_BATCH_ENVELOPE_BYTES`], 64 MiB) with up to about
 /// 12 KiB of copied envelope per member, so an end-to-end-encrypted batch
 /// carrying a few RSA-4096-wrapped data keys is accepted.
 pub const DEFAULT_MAX_BATCH_MEMBERS: u32 = 5_000;
+
+/// The default most bytes one batch's members may spend copying the
+/// envelope: 64 MiB, the same value as the receive-queue budget but its
+/// own knob.
+pub const DEFAULT_MAX_BATCH_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The least envelope-copy bound honoured: a smaller setting (0 would
+/// refuse every batch) is raised to this.
+pub const MIN_MAX_BATCH_ENVELOPE_BYTES: usize = 64 * 1024;
+
+/// The envelope-copy bound for a configured `max_batch_envelope_bytes`:
+/// the default when unset, never below [`MIN_MAX_BATCH_ENVELOPE_BYTES`].
+pub(crate) fn envelope_bound(configured: Option<usize>) -> usize {
+    configured
+        .unwrap_or(DEFAULT_MAX_BATCH_ENVELOPE_BYTES)
+        .max(MIN_MAX_BATCH_ENVELOPE_BYTES)
+}
 
 /// The fixed in-memory cost of one batch member beyond its copied envelope.
 const MEMBER_OVERHEAD: usize =
@@ -304,7 +321,7 @@ mod tests {
 
     const LIMIT: usize = 1024 * 1024;
     const MEMBERS: u32 = DEFAULT_MAX_BATCH_MEMBERS;
-    const ENVELOPE: usize = crate::consumer::DEFAULT_MAX_QUEUED_BYTES;
+    const ENVELOPE: usize = DEFAULT_MAX_BATCH_ENVELOPE_BYTES;
 
     fn bomb() -> Vec<u8> {
         vec![0u8; LIMIT * 8]
@@ -752,6 +769,34 @@ mod tests {
         );
     }
 
+    /// A data key's own `metadata` entries are cloned with it, so they are
+    /// measured too: 1000 empty entries under one key cost their structs.
+    #[test]
+    fn nested_encryption_key_metadata_is_measured() {
+        let metadata = crate::message::Metadata {
+            encryption_keys: vec![proto::EncryptionKeys {
+                key: "k".into(),
+                metadata: vec![proto::KeyValue::default(); 1000],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            metadata_footprint(&metadata)
+                >= std::mem::size_of::<proto::EncryptionKeys>()
+                    + 1000 * std::mem::size_of::<proto::KeyValue>()
+        );
+    }
+
+    /// Unset is the default; a configured bound is honoured, but never
+    /// below the minimum (0 would refuse every batch).
+    #[test]
+    fn the_envelope_bound_defaults_and_is_clamped() {
+        assert_eq!(envelope_bound(None), DEFAULT_MAX_BATCH_ENVELOPE_BYTES);
+        assert_eq!(envelope_bound(Some(0)), MIN_MAX_BATCH_ENVELOPE_BYTES);
+        assert_eq!(envelope_bound(Some(1 << 30)), 1 << 30);
+    }
+
     /// An honest end-to-end-encrypted batch at the member cap: 5000 members
     /// under an envelope carrying two RSA-4096-wrapped data keys (512-byte
     /// values) is accepted at the DEFAULT decompressed-size cap, since the
@@ -773,7 +818,7 @@ mod tests {
             payload,
             DEFAULT_MAX_DECOMPRESSED_SIZE,
             DEFAULT_MAX_BATCH_MEMBERS,
-            crate::consumer::DEFAULT_MAX_QUEUED_BYTES,
+            DEFAULT_MAX_BATCH_ENVELOPE_BYTES,
         )
         .unwrap();
         assert_eq!(members.len(), DEFAULT_MAX_BATCH_MEMBERS as usize);
