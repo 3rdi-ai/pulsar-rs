@@ -1,0 +1,9 @@
+# cargo-audit configuration: THE MACHINE HALF of a waiver. cargo-audit reads
+# `.cargo/audit.toml` relative to its working directory, and CI scans at the
+# repo root. Every id in `ignore` MUST have a matching dated entry in the
+# repo-root `audit-waivers.toml`; prophesee-platform's cargo-audit-waivers.mjs
+# reconciles the two inside the cargo-audit job, before the scan. This file may
+# contain nothing but this one table and key.
+
+[advisories]
+ignore = []

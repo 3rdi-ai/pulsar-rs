@@ -1,0 +1,56 @@
+name: Supply Chain
+
+# The 3rdi-ai fork's caller for the fleet's shared supply-chain gates
+# (prophesee-platform/.github/workflows/supply-chain.yml): an SBOM plus the
+# cargo-audit advisory gate with the expiring-waiver ladder. The org ruleset
+# "default-branch-security-checks" requires the four `supply-chain / ...`
+# checks on the default branch; this workflow is what produces them. Upstream's
+# rust.yml is left untouched so the fork stays easy to rebase.
+#
+# CHECK-RUN NAMES: a reusable workflow's checks report as
+# `<caller job id> / <called job name>`. The job id below MUST stay
+# `supply-chain`; renaming it renames the required status checks.
+#
+# ABSENT ECOSYSTEMS: this crate has no npm or Go code, so `ecosystems` lists
+# only rust. The npm-audit and govulncheck jobs are then skipped by their
+# job-level `if:`; a job skipped that way still CONCLUDES (as skipped, which
+# required checks accept), whereas a job that never triggers reports nothing
+# and blocks the PR forever. No trigger-level path filter, for the same reason.
+#
+# THE PIN IS A RELEASE TAG. supply-chain.yml is FLOORED in
+# prophesee-platform's .github/shared-workflow-floors.env (v1.6.30), and a
+# floored workflow must be pinned by a vX.Y.Z tag at or above its floor. The
+# gate scripts are read at exactly this pin, so a gate change on platform main
+# takes effect here only when this line is bumped.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  supply-chain:
+    permissions:
+      contents: read
+    uses: 3rdi-ai/prophesee-platform/.github/workflows/supply-chain.yml@v1.6.142
+    with:
+      ecosystems: '["rust"]'
+      # Count CARGO packages, not the total: an SBOM that catalogued only the
+      # repo itself is the blind case. The floor is 1 because blind is zero.
+      sbom-floor-ecosystem: 'cargo'
+      sbom-min-packages: 1
+    secrets:
+      APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+      APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+      # Read-only App (3rdi-ci-read): every mint in the shared workflow asks
+      # only for contents:read on prophesee-platform.
+      CI_READ_APP_ID: ${{ secrets.CI_READ_APP_ID }}
+      CI_READ_APP_PRIVATE_KEY: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
