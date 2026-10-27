@@ -574,8 +574,15 @@ pub(crate) fn parse_batched_message(
     count: u32,
     payload: &[u8],
 ) -> Result<Vec<BatchedMessage>, ConnectionError> {
-    let (_, result) = nom::multi::count(batched_message, count as usize)(payload)
+    let (rest, result) = nom::multi::count(batched_message, count as usize)(payload)
         .map_err(|err| decoding_error("batched messages", err))?;
+    // A table longer than its declared members is not what it declares.
+    if !rest.is_empty() {
+        return Err(ConnectionError::Decoding(format!(
+            "{} bytes past the {count} declared batched messages",
+            rest.len()
+        )));
+    }
     Ok(result)
 }
 

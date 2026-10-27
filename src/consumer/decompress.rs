@@ -232,6 +232,7 @@ mod tests {
     use std::io::Write;
 
     const LIMIT: usize = 1024 * 1024;
+    const MEMBERS: u32 = DEFAULT_MAX_BATCH_MEMBERS;
 
     fn bomb() -> Vec<u8> {
         vec![0u8; LIMIT * 8]
@@ -679,6 +680,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(members.len(), 10_000);
+    }
+
+    /// Bytes left after the declared members mean the table is not what
+    /// it declares: refused, with the bytes.
+    #[test]
+    fn a_batch_with_bytes_past_its_members_is_refused() {
+        use crate::message::{proto::SingleMessageMetadata, BatchedMessage};
+        let mut table = Vec::new();
+        BatchedMessage {
+            metadata: SingleMessageMetadata {
+                payload_size: 3,
+                ..Default::default()
+            },
+            payload: b"one".to_vec(),
+        }
+        .serialize(&mut table);
+        table.extend_from_slice(b"xyz");
+        let payload = batch_payload(table.clone(), None, None, 1);
+        let (back, reason) =
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
+        assert!(
+            matches!(reason, DecodeRefusal::Undecodable(_)),
+            "{reason:?}"
+        );
+        assert_eq!(back.data, table);
     }
 
     #[test]
