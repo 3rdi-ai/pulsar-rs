@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6b21b0b5805567e0e7a293be7ace236df81e8d0073638f3d127f2ad56df4eca3 # shrinks to codec = None, declared = None, count = Some(0), data = []
+cc 15c2e8bda2d4fb3c57f2ce2841cdcad5d037ff1d631e63dd7ced555ad79f088e # shrinks to codec = None, declared = None, count = Some(1), data = [], keys = 4790, replicas = 29301, properties = 0, empty_table = true

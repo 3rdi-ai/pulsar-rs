@@ -128,6 +128,7 @@ mod tests {
             payload,
             usize::MAX,
             crate::consumer::DEFAULT_MAX_BATCH_MEMBERS,
+            crate::consumer::DEFAULT_MAX_QUEUED_BYTES,
         )
         .unwrap();
 

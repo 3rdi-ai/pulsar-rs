@@ -17,6 +17,7 @@ use std::{
 
 use futures::{channel::mpsc, Stream};
 
+use super::decompress::metadata_footprint;
 use crate::{message::proto::MessageIdData, Error, Payload};
 
 /// The default most decoded payload bytes queued for one consumer.
@@ -24,8 +25,12 @@ pub const DEFAULT_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 type Item = Result<(MessageIdData, Payload), Error>;
 
+/// What a queued item holds: its data plus its metadata, measured
+/// structurally (a payload of no data but large properties is not free).
 fn bytes_of(item: &Item) -> usize {
-    item.as_ref().map_or(0, |(_, payload)| payload.data.len())
+    item.as_ref().map_or(0, |(_, payload)| {
+        payload.data.len() + metadata_footprint(&payload.metadata)
+    })
 }
 
 #[derive(Default)]
@@ -33,6 +38,9 @@ struct State {
     queued: usize,
     /// The engine is the queue's only sender, so one waiter suffices.
     waiter: Option<Waker>,
+    /// The consumer dropped its end: a waiting send stops waiting and
+    /// fails on the closed channel.
+    closed: bool,
 }
 
 struct Budget {
@@ -47,7 +55,7 @@ impl Budget {
 
     fn poll_reserve(&self, bytes: usize, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.lock();
-        if state.queued == 0 || state.queued.saturating_add(bytes) <= self.max {
+        if state.closed || state.queued == 0 || state.queued.saturating_add(bytes) <= self.max {
             state.queued += bytes;
             Poll::Ready(())
         } else {
@@ -60,6 +68,18 @@ impl Budget {
         let waiter = {
             let mut state = self.lock();
             state.queued = state.queued.saturating_sub(bytes);
+            state.waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+
+    /// Marks the queue closed and wakes a waiting send.
+    fn close(&self) {
+        let waiter = {
+            let mut state = self.lock();
+            state.closed = true;
             state.waiter.take()
         };
         if let Some(waiter) = waiter {
@@ -119,6 +139,15 @@ impl QueueReceiver {
     #[cfg(test)]
     pub(crate) fn queued_bytes(&self) -> usize {
         self.budget.lock().queued
+    }
+}
+
+impl Drop for QueueReceiver {
+    /// Closes the channel first, so the woken send's `poll_ready` sees the
+    /// disconnect instead of queueing into a receiver about to go away.
+    fn drop(&mut self) {
+        self.rx.close();
+        self.budget.close();
     }
 }
 
@@ -184,23 +213,24 @@ mod tests {
     /// next send waits, and taking one payload wakes it and lets it through.
     #[test]
     fn a_stalled_consumer_holds_at_most_the_budget() {
-        const BUDGET: usize = 64 * 1024;
         const EACH: usize = 8 * 1024;
-        let (mut tx, mut rx) = receive_queue(1000, BUDGET);
+        // Eight payloads' bytes, metadata included.
+        let budget = 8 * bytes_of(&payload(EACH));
+        let (mut tx, mut rx) = receive_queue(1000, budget);
         let wakes = Arc::new(Wakes::default());
         let waker = futures::task::waker(Arc::clone(&wakes));
         let mut cx = Context::from_waker(&waker);
-        for i in 0..BUDGET / EACH {
+        for i in 0..8 {
             let sent = tx.send(payload(EACH)).now_or_never();
             assert!(matches!(sent, Some(Ok(()))), "payload {i} fits the budget");
         }
-        assert_eq!(rx.queued_bytes(), BUDGET);
+        assert_eq!(rx.queued_bytes(), budget);
         let mut pending = Box::pin(tx.send(payload(EACH)));
         assert!(
             pending.as_mut().poll(&mut cx).is_pending(),
             "the send past the budget waits"
         );
-        assert_eq!(rx.queued_bytes(), BUDGET, "a waiting send queues nothing");
+        assert_eq!(rx.queued_bytes(), budget, "a waiting send queues nothing");
 
         assert!(rx.next().now_or_never().flatten().is_some());
         assert_eq!(
@@ -209,7 +239,7 @@ mod tests {
             "taking one wakes the engine"
         );
         assert!(pending.as_mut().poll(&mut cx).is_ready());
-        assert_eq!(rx.queued_bytes(), BUDGET);
+        assert_eq!(rx.queued_bytes(), budget);
     }
 
     /// One payload larger than the whole budget still goes through an empty
@@ -218,7 +248,7 @@ mod tests {
     fn a_payload_past_the_budget_passes_an_empty_queue() {
         let (mut tx, mut rx) = receive_queue(10, 1024);
         tx.send(payload(4096)).now_or_never().unwrap().unwrap();
-        assert_eq!(rx.queued_bytes(), 4096);
+        assert_eq!(rx.queued_bytes(), bytes_of(&payload(4096)));
         assert!(rx.next().now_or_never().flatten().is_some());
         assert_eq!(rx.queued_bytes(), 0);
     }
@@ -234,9 +264,68 @@ mod tests {
             tx.send(payload(200)).now_or_never().is_none(),
             "the channel is full"
         );
-        assert_eq!(rx.queued_bytes(), 100);
+        assert_eq!(rx.queued_bytes(), bytes_of(&payload(100)));
         let mut rx = rx;
         assert!(rx.next().now_or_never().flatten().is_some());
         assert_eq!(rx.queued_bytes(), 0, "the queued item's bytes, once");
+    }
+
+    /// A payload with no data still costs its metadata: 1000 properties of
+    /// 1 KiB values take a whole 64 KiB budget, so the next such payload
+    /// waits instead of queueing for free.
+    #[test]
+    fn metadata_counts_against_the_budget() {
+        fn heavy() -> Item {
+            let mut item = payload(0);
+            if let Ok((_, payload)) = &mut item {
+                payload.metadata.properties = (0..1000)
+                    .map(|i| crate::message::proto::KeyValue {
+                        key: format!("k{i}"),
+                        value: "v".repeat(1024),
+                    })
+                    .collect();
+            }
+            item
+        }
+        let (mut tx, rx) = receive_queue(1000, 64 * 1024);
+        tx.send(heavy()).now_or_never().unwrap().unwrap();
+        assert!(
+            rx.queued_bytes() > 1000 * 1024,
+            "queued {} bytes for 1 MiB of properties",
+            rx.queued_bytes()
+        );
+        assert!(
+            tx.send(heavy()).now_or_never().is_none(),
+            "the second payload waits for the budget"
+        );
+    }
+
+    /// The consumer dropped while the engine waits on the budget: the wait
+    /// is woken and the send fails (the engine then stops), instead of
+    /// parking forever. Polled by hand, so nothing waits on a clock.
+    #[test]
+    fn dropping_the_receiver_fails_a_send_waiting_on_the_budget() {
+        let (mut tx, rx) = receive_queue(1000, 1024);
+        tx.send(payload(1024)).now_or_never().unwrap().unwrap();
+        let wakes = Arc::new(Wakes::default());
+        let waker = futures::task::waker(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = Box::pin(tx.send(payload(1024)));
+        assert!(
+            pending.as_mut().poll(&mut cx).is_pending(),
+            "over the budget"
+        );
+
+        drop(rx);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the drop wakes the engine"
+        );
+        match pending.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(_)) => {}
+            Poll::Ready(Ok(())) => panic!("a send to a dropped consumer succeeded"),
+            Poll::Pending => panic!("the send still waits on a dropped consumer"),
+        }
     }
 }

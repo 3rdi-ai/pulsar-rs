@@ -43,10 +43,8 @@ pub struct ConsumerOptions {
     /// [`crate::consumer::DEFAULT_MAX_BATCH_MEMBERS`] (5_000, five times
     /// the producers' default batch). A batch past it is refused and
     /// settled like any undecodable message. A second bound applies with
-    /// it: the members' copies of the envelope (about 500 bytes each plus
-    /// the envelope's copied fields) must fit `max_decompressed_size`, so
-    /// raising this cap past `max_decompressed_size / 1 KiB` or so needs
-    /// that cap raised too.
+    /// it: the members' copies of the envelope must fit
+    /// `max_batch_envelope_bytes`.
     pub max_batch_members: Option<u32>,
     /// The most decoded payload bytes queued for this consumer and not yet
     /// taken; `None` means [`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`]
@@ -56,6 +54,15 @@ pub struct ConsumerOptions {
     /// `receiver_queue_size` bounds the count of queued messages, this
     /// bounds their bytes: whichever is reached first holds the engine.
     pub max_queued_bytes: Option<usize>,
+    /// The most bytes one batch's members may spend copying the envelope
+    /// (each member clones the envelope's metadata, measured structurally,
+    /// plus about 500 bytes of per-member structs); `None` means
+    /// [`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`] (64 MiB). A batch past
+    /// it is refused and settled like any undecodable message. It is its
+    /// own bound, not `max_decompressed_size`, so an end-to-end-encrypted
+    /// batch of thousands of members (each copying the wrapped data keys)
+    /// is accepted at the defaults.
+    pub max_batch_envelope_bytes: Option<usize>,
 }
 
 impl ConsumerOptions {
@@ -80,6 +87,15 @@ impl ConsumerOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_max_queued_bytes(mut self, bytes: usize) -> Self {
         self.max_queued_bytes = Some(bytes);
+        self
+    }
+
+    /// within options, sets the most bytes one batch's members may spend
+    /// copying the envelope (see
+    /// [`ConsumerOptions::max_batch_envelope_bytes`])
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_max_batch_envelope_bytes(mut self, bytes: usize) -> Self {
+        self.max_batch_envelope_bytes = Some(bytes);
         self
     }
 

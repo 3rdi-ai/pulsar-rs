@@ -36,6 +36,41 @@ The cap is `ConsumerOptions::max_decompressed_size` (default
 `DEFAULT_MAX_DECOMPRESSED_SIZE`, 5 MiB), so a topic with large legitimate
 messages can raise it on purpose.
 
+## v6.9.1-3rdi.8
+
+Supersedes `v6.9.1-3rdi.7` (left in place, not deleted). Fixes from the
+security review of .7:
+
+- **New public item** (additive): `ConsumerOptions::max_batch_envelope_bytes`
+  / `with_max_batch_envelope_bytes`, default `DEFAULT_MAX_QUEUED_BYTES`
+  (64 MiB). The members' envelope copies are bounded by THIS, no longer by
+  `max_decompressed_size`, so the two caps no longer interact: an honest
+  end-to-end-encrypted batch of 5000 members carrying RSA-4096-wrapped data
+  keys is accepted at the defaults (under .7 it was refused). Peak memory per
+  message is the received bytes plus about twice `max_decompressed_size` plus
+  `max_batch_envelope_bytes`.
+- **Structural measure**: a metadata's cost is its encoded length plus the
+  in-memory struct of every repeated element (`properties`, `replicate_to`,
+  `encryption_keys` and each key's own `metadata`). `encoded_len` alone
+  under-measured many EMPTY entries about 35x (20k empty `encryption_keys`:
+  about 40 KB encoded, 1.44 MB per clone). The same measure bounds the
+  envelope copies and the receive queue.
+- **Receive queue**: a payload's budget cost is its data PLUS its metadata,
+  so zero-data payloads with large properties are no longer free. Dropping
+  the consumer while the engine waits on the budget now wakes the engine,
+  whose send fails, so the engine stops and sends `CloseConsumer` (before
+  this it parked forever and the broker kept a zombie consumer).
+- **Non-positive batch counts**: an entry declaring zero or fewer members is
+  still refused and acknowledged, and the consumer then **resubscribes**
+  (CloseConsumer + subscribe), which resets the broker's permits: the
+  single-active-consumer dispatcher (Exclusive/Failover) credits permits on
+  a negative count, and `i32::MIN` overflowed its window and stalled the
+  subscription for good. One `warn!` per resubscribe. A **Shared**
+  subscription's dispatcher never sends such an entry at all (it computes
+  a non-positive message count and skips it), and the subscription stalls
+  for good BROKER-side: against a 5.0.0 standalone broker, no later honest
+  message was delivered. No client change reaches that.
+
 ## v6.9.1-3rdi.7
 
 Supersedes `v6.9.1-3rdi.6` (left in place, not deleted).

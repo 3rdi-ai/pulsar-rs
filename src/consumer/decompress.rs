@@ -7,11 +7,12 @@
 //!
 //! A batch is bounded before it is decompressed or split: past
 //! `max_members` members, or when its members' copies of the envelope would
-//! cost more than `limit` (each member copies the envelope minus the fields
-//! it replaces, plus a `Metadata` and a `MessageIdData`), it is refused. So
-//! one message peaks at about its received bytes plus three times `limit`:
-//! the decompressed table, the members' own metadata and payloads cut from
-//! it, and the envelope copies.
+//! cost more than `max_envelope_bytes` (each member copies the envelope
+//! minus the fields it replaces, measured structurally by
+//! [`metadata_footprint`], plus a `Metadata` and a `MessageIdData`), it is
+//! refused. So one message peaks at about its received bytes plus twice
+//! `limit` (the decompressed table, and the members' own metadata and
+//! payloads cut from it) plus `max_envelope_bytes` of envelope copies.
 
 use crate::{
     consumer::batched_message_iterator::BatchedMessageIterator,
@@ -24,10 +25,11 @@ use crate::{
 pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 5 * 1024 * 1024;
 
 /// The default most members one batch may declare: five times the member
-/// cap Pulsar producers default to (`batchingMaxMessages`, 1000). At the
-/// default `max_decompressed_size` a full batch of this many members still
-/// fits the envelope-copy bound (about 500 bytes of per-member structs plus
-/// a few hundred bytes of copied envelope each).
+/// cap Pulsar producers default to (`batchingMaxMessages`, 1000). A full
+/// batch of this many members fits the default envelope-copy bound
+/// ([`crate::consumer::DEFAULT_MAX_QUEUED_BYTES`], 64 MiB) with up to about
+/// 12 KiB of copied envelope per member, so an end-to-end-encrypted batch
+/// carrying a few RSA-4096-wrapped data keys is accepted.
 pub const DEFAULT_MAX_BATCH_MEMBERS: u32 = 5_000;
 
 /// The fixed in-memory cost of one batch member beyond its copied envelope.
@@ -60,6 +62,26 @@ impl MemberOwned {
     }
 }
 
+/// The bytes one in-memory copy of `metadata` holds, beyond its own struct:
+/// its encoded length (which bounds the heap its strings and bytes take)
+/// plus the struct of every repeated element. An empty entry encodes in two
+/// bytes but a clone allocates its whole struct, so `encoded_len` alone
+/// under-measures a metadata of many empty entries by about 35 times.
+pub(crate) fn metadata_footprint(metadata: &proto::MessageMetadata) -> usize {
+    use std::mem::size_of;
+    let keys: usize = metadata
+        .encryption_keys
+        .iter()
+        .map(|key| {
+            size_of::<proto::EncryptionKeys>() + key.metadata.len() * size_of::<proto::KeyValue>()
+        })
+        .sum();
+    prost::Message::encoded_len(metadata)
+        + metadata.properties.len() * size_of::<proto::KeyValue>()
+        + metadata.replicate_to.len() * size_of::<String>()
+        + keys
+}
+
 fn undecodable(e: impl std::fmt::Display) -> DecodeRefusal {
     DecodeRefusal::Undecodable(e.to_string())
 }
@@ -86,7 +108,8 @@ pub(crate) type Decoded = (proto::MessageIdData, Payload);
 
 /// Decodes one broker message into the payloads it carries: decompressed
 /// under `limit` and, for a batch envelope, split into at most
-/// `max_members` members.
+/// `max_members` members whose envelope copies total at most
+/// `max_envelope_bytes` (measured by [`metadata_footprint`]).
 ///
 /// Every way the message can fail to decode (an unknown codec, a refused
 /// decompression, a member table that does not parse) is a [`DecodeRefusal`]
@@ -98,6 +121,7 @@ pub(crate) fn decode_payload(
     payload: Payload,
     limit: usize,
     max_members: u32,
+    max_envelope_bytes: usize,
 ) -> Result<Vec<Decoded>, Box<(Payload, DecodeRefusal)>> {
     let compression = match payload.metadata.compression {
         None => proto::CompressionType::None,
@@ -144,10 +168,10 @@ pub(crate) fn decode_payload(
     // Every member copies what is left of the envelope, which the frame
     // alone bounds only to megabytes: the copies, not the member table, are
     // what a small batch would amplify into an OOM.
-    let per_member = prost::Message::encoded_len(&metadata) + MEMBER_OVERHEAD;
-    if (count as usize).saturating_mul(per_member) > limit {
+    let per_member = metadata_footprint(&metadata) + MEMBER_OVERHEAD;
+    if (count as usize).saturating_mul(per_member) > max_envelope_bytes {
         let reason = undecodable(format!(
-            "batch of {count} messages would copy {per_member} bytes each past the {limit}-byte cap"
+            "batch of {count} messages would copy {per_member} bytes each past the {max_envelope_bytes}-byte envelope bound"
         ));
         let metadata = owned.restore(metadata);
         return Err(Box::new((Payload { data, metadata }, reason)));
@@ -280,6 +304,7 @@ mod tests {
 
     const LIMIT: usize = 1024 * 1024;
     const MEMBERS: u32 = DEFAULT_MAX_BATCH_MEMBERS;
+    const ENVELOPE: usize = crate::consumer::DEFAULT_MAX_QUEUED_BYTES;
 
     fn bomb() -> Vec<u8> {
         vec![0u8; LIMIT * 8]
@@ -518,6 +543,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap();
         assert_eq!(members.len(), 4);
@@ -605,6 +631,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap_err();
         assert!(
@@ -657,6 +684,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap_err();
         let reason = reason.to_string();
@@ -686,13 +714,70 @@ mod tests {
             });
         let data = payload.data.clone();
         let (back, reason) =
-            *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS, ENVELOPE).unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
         );
         assert_eq!(back.data, data);
         assert_eq!(back.metadata.replicate_to.len(), 1, "refused as it arrived");
+    }
+
+    /// 20_000 EMPTY `encryption_keys` encode to about 40 KB, but every
+    /// member's clone allocates one `EncryptionKeys` struct per entry
+    /// (about 1.4 MB): over 100 members that is past the envelope bound, so
+    /// the batch is refused, as it arrived.
+    #[test]
+    fn many_empty_repeated_entries_are_measured_by_what_a_clone_allocates() {
+        const KEYS: usize = 20_000;
+        let mut payload = empty_members(100);
+        payload.metadata.encryption_keys = vec![proto::EncryptionKeys::default(); KEYS];
+        assert!(
+            metadata_footprint(&payload.metadata)
+                >= KEYS * std::mem::size_of::<proto::EncryptionKeys>(),
+            "the footprint counts each entry's struct"
+        );
+        let data = payload.data.clone();
+        let (back, reason) =
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS, ENVELOPE).unwrap_err();
+        assert!(
+            matches!(reason, DecodeRefusal::Undecodable(_)),
+            "{reason:?}"
+        );
+        assert_eq!(back.data, data);
+        assert_eq!(
+            back.metadata.encryption_keys.len(),
+            KEYS,
+            "refused as it arrived"
+        );
+    }
+
+    /// An honest end-to-end-encrypted batch at the member cap: 5000 members
+    /// under an envelope carrying two RSA-4096-wrapped data keys (512-byte
+    /// values) is accepted at the DEFAULT decompressed-size cap, since the
+    /// envelope copies have their own bound.
+    #[test]
+    fn a_full_encrypted_batch_with_two_rsa_4096_keys_is_accepted() {
+        let mut payload = empty_members(DEFAULT_MAX_BATCH_MEMBERS as usize);
+        payload.metadata.encryption_algo = Some("RSA-OAEP".into());
+        payload.metadata.encryption_param = Some(vec![9u8; 12]);
+        payload.metadata.encryption_keys = (0..2)
+            .map(|i| proto::EncryptionKeys {
+                key: format!("tenant-data-key-{i}.pem"),
+                value: vec![7u8; 512],
+                ..Default::default()
+            })
+            .collect();
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            DEFAULT_MAX_DECOMPRESSED_SIZE,
+            DEFAULT_MAX_BATCH_MEMBERS,
+            crate::consumer::DEFAULT_MAX_QUEUED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(members.len(), DEFAULT_MAX_BATCH_MEMBERS as usize);
+        assert_eq!(members[0].1.metadata.encryption_keys.len(), 2);
     }
 
     /// Envelope properties are not copied to members (each member carries
@@ -710,6 +795,7 @@ mod tests {
             payload,
             DEFAULT_MAX_DECOMPRESSED_SIZE,
             MEMBERS,
+            ENVELOPE,
         )
         .unwrap();
         assert_eq!(members.len(), 2000);
@@ -729,6 +815,7 @@ mod tests {
             payload,
             DEFAULT_MAX_DECOMPRESSED_SIZE,
             MEMBERS,
+            ENVELOPE,
         )
         .unwrap_err();
         assert!(
@@ -749,7 +836,8 @@ mod tests {
             Some(64),
             MEMBERS as i32 + 1,
         );
-        let (_, reason) = *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
+        let (_, reason) =
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS, ENVELOPE).unwrap_err();
         assert!(reason.to_string().contains("member cap"), "{reason}");
     }
 
@@ -762,6 +850,7 @@ mod tests {
             payload,
             DEFAULT_MAX_DECOMPRESSED_SIZE,
             MEMBERS,
+            ENVELOPE,
         )
         .unwrap();
         assert_eq!(members.len(), MEMBERS as usize);
@@ -799,7 +888,8 @@ mod tests {
         });
         payload.metadata.partition_key = Some("envelope-key".into());
         payload.metadata.ordering_key = Some(b"envelope-order".to_vec());
-        let members = decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap();
+        let members =
+            decode_payload(Default::default(), payload, LIMIT, MEMBERS, ENVELOPE).unwrap();
         assert_eq!(members.len(), 2);
         let first = &members[0].1.metadata;
         assert_eq!(first.properties.len(), 1);
@@ -830,7 +920,7 @@ mod tests {
         table.extend_from_slice(b"xyz");
         let payload = batch_payload(table.clone(), None, None, 1);
         let (back, reason) =
-            *decode_payload(Default::default(), payload, LIMIT, MEMBERS).unwrap_err();
+            *decode_payload(Default::default(), payload, LIMIT, MEMBERS, ENVELOPE).unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
@@ -847,6 +937,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap_err();
         assert!(
@@ -883,6 +974,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap();
         let data: Vec<_> = members.iter().map(|(_, p)| p.data.clone()).collect();
@@ -900,6 +992,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap_err();
         assert!(
@@ -918,6 +1011,7 @@ mod tests {
             payload,
             LIMIT,
             DEFAULT_MAX_BATCH_MEMBERS,
+            ENVELOPE,
         )
         .unwrap();
         assert_eq!(members.len(), 1);
@@ -957,6 +1051,7 @@ mod tests {
                     payload,
                     LIMIT,
                     DEFAULT_MAX_BATCH_MEMBERS,
+                    ENVELOPE,
                 )
                 .unwrap_err();
                 assert!(
@@ -967,6 +1062,10 @@ mod tests {
             }
         }
     }
+
+    /// The envelope-copy bound the proptest decodes under, small enough that
+    /// the generated repeated-field counts reach both arms.
+    const PROP_ENVELOPE: usize = 1024 * 1024;
 
     proptest::proptest! {
         /// Whatever a publisher puts in the codec, declared size, batch count
@@ -984,25 +1083,61 @@ mod tests {
                 proptest::prelude::Just(i32::MIN),
             ]),
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+            keys in 0usize..30_000,
+            replicas in 0usize..30_000,
+            properties in 0usize..30_000,
+            empty_table in proptest::prelude::any::<bool>(),
         ) {
+            // Random bytes rarely parse as a member table, so half the cases
+            // carry a valid table of empty members (uncompressed) to reach
+            // the envelope-copy bound.
+            let (codec, data) = match count {
+                Some(n @ 1..=5) if empty_table => (None, vec![0u8; 4 * n as usize]),
+                _ => (codec, data),
+            };
             let payload = crate::Payload {
                 metadata: crate::message::Metadata {
                     producer_name: "prop".into(),
                     num_messages_in_batch: count,
                     compression: codec,
                     uncompressed_size: declared,
+                    encryption_keys: vec![proto::EncryptionKeys::default(); keys],
+                    replicate_to: vec![String::new(); replicas],
+                    properties: vec![proto::KeyValue::default(); properties],
                     ..Default::default()
                 },
                 data: data.clone(),
             };
-            match decode_payload(Default::default(), payload, LIMIT, DEFAULT_MAX_BATCH_MEMBERS) {
-                Ok(members) => proptest::prop_assert_eq!(
-                    members.len(),
-                    count.map_or(1, |c| c as usize)
-                ),
+            match decode_payload(
+                Default::default(),
+                payload,
+                LIMIT,
+                DEFAULT_MAX_BATCH_MEMBERS,
+                PROP_ENVELOPE,
+            ) {
+                Ok(members) => {
+                    proptest::prop_assert_eq!(members.len(), count.map_or(1, |c| c as usize));
+                    if count.is_some() {
+                        // What each member's clone allocates for the copied
+                        // repeated fields, measured independently of the
+                        // code under test.
+                        let copied = keys * std::mem::size_of::<proto::EncryptionKeys>()
+                            + replicas * std::mem::size_of::<String>()
+                            + MEMBER_OVERHEAD;
+                        proptest::prop_assert!(
+                            members.len().saturating_mul(copied) <= PROP_ENVELOPE,
+                            "{} members x {} bytes accepted",
+                            members.len(),
+                            copied
+                        );
+                    }
+                }
                 Err(refused) => {
                     let (back, reason) = *refused;
                     proptest::prop_assert_eq!(&back.data, &data);
+                    proptest::prop_assert_eq!(back.metadata.encryption_keys.len(), keys);
+                    proptest::prop_assert_eq!(back.metadata.replicate_to.len(), replicas);
+                    proptest::prop_assert_eq!(back.metadata.properties.len(), properties);
                     let reason = reason.to_string();
                     proptest::prop_assert!(reason.len() < 256, "{} bytes: {}", reason.len(), reason);
                     if data.len() >= 8 {

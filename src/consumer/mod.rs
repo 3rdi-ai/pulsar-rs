@@ -1926,7 +1926,7 @@ mod tests {
     /// the consumer's permits, so the client must book the same debit and
     /// grant it back, or the broker stops dispatching. Every ordinary
     /// message published after the hostile entry must still arrive.
-    async fn ordinary_messages_flow_after_a_declared_count(count: i32) {
+    async fn ordinary_messages_flow_after_a_declared_count(count: i32, sub_type: SubType) {
         const BATCH: u32 = 10;
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
@@ -1939,6 +1939,7 @@ mod tests {
             .consumer()
             .with_topic(&topic)
             .with_subscription("declared")
+            .with_subscription_type(sub_type)
             .with_batch_size(BATCH)
             .with_options(ConsumerOptions {
                 initial_position: InitialPosition::Earliest,
@@ -1995,12 +1996,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_declaring_i32_max_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(i32::MAX).await;
+        ordinary_messages_flow_after_a_declared_count(i32::MAX, SubType::Shared).await;
     }
 
     #[tokio::test]
     async fn a_batch_declaring_70000_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(70_000).await;
+        ordinary_messages_flow_after_a_declared_count(70_000, SubType::Shared).await;
+    }
+
+    /// A negative count makes the single-active-consumer dispatcher CREDIT
+    /// permits; `i32::MIN` overflows its window negative, so only a
+    /// resubscribe recovers it. (A Shared subscription's dispatcher never
+    /// sends such an entry at all: it stalls broker-side, out of reach.)
+    #[tokio::test]
+    async fn a_batch_declaring_minus_one_members_does_not_stall_dispatch() {
+        ordinary_messages_flow_after_a_declared_count(-1, SubType::Exclusive).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_declaring_i32_min_members_does_not_stall_dispatch() {
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive).await;
     }
 
     /// Decodes to 8 MiB of zeros: past the 5 MiB default cap, tiny on the wire.

@@ -33,8 +33,9 @@ use crate::{
 /// debits them: the declared `num_messages_in_batch`, unclamped
 /// (`AbstractBaseDispatcher` sums it, `Consumer.sendMessages` subtracts
 /// it), so the window mirrors the broker's and the next flow re-grants it.
-/// Zero or negative (the broker credits instead) is booked as 1: the broker
-/// then holds that many more permits than this window until a reconnect.
+/// Zero or negative (the broker credits instead, and `i32::MIN` overflows
+/// its window negative) is booked as 1, and the engine then resubscribes,
+/// which resets the broker's permits to this window's.
 fn permits_consumed(num_messages_in_batch: Option<i32>) -> i64 {
     i64::from(num_messages_in_batch.unwrap_or(1)).max(1)
 }
@@ -284,18 +285,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         );
                         payload.metadata.num_messages_in_batch
                     }));
-                if let Some(count @ ..=0) = message
+                // A count of zero or less is refused (and acknowledged) like
+                // any undecodable batch, but the broker has already credited
+                // permits for it, so the consumer then resubscribes:
+                // CloseConsumer and a fresh subscribe reset the broker's
+                // window.
+                let forged = message
                     .payload
                     .as_ref()
                     .and_then(|p| p.metadata.num_messages_in_batch)
-                {
-                    warn!(
-                        "{}: entry declares {count} messages; booked as 1 permit until reconnect",
-                        self.debug_format()
-                    );
-                }
+                    .filter(|count| *count <= 0);
 
-                match self.process_message(message).await {
+                let outcome = match self.process_message(message).await {
                     // Continue
                     Ok(true) => None,
                     // End of Topic
@@ -308,7 +309,17 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                             None
                         }
                     }
+                };
+                if let (Some(count), None) = (forged, &outcome) {
+                    warn!(
+                        "{}: entry declares {count} messages; resubscribing to reset the broker's permits",
+                        self.debug_format()
+                    );
+                    if let Err(e) = self.reconnect().await {
+                        return Some(Err(e));
+                    }
                 }
+                outcome
             }
         }
     }
@@ -487,8 +498,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .options
             .max_batch_members
             .unwrap_or(super::decompress::DEFAULT_MAX_BATCH_MEMBERS);
+        let max_envelope = self
+            .options
+            .max_batch_envelope_bytes
+            .unwrap_or(super::DEFAULT_MAX_QUEUED_BYTES);
         let id = message.message_id.clone();
-        let payloads = match super::decompress::decode_payload(id, payload, limit, max_members) {
+        let payloads = match super::decompress::decode_payload(
+            id,
+            payload,
+            limit,
+            max_members,
+            max_envelope,
+        ) {
             Ok(payloads) => payloads,
             Err(refused) => {
                 let (payload, reason) = *refused;
