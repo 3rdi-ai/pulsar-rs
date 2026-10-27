@@ -29,12 +29,63 @@ fn decoding_error(what: &str, err: nom::Err<nom::error::Error<&[u8]>>) -> Connec
 ///
 /// this structure holds any command sent to pulsar, like looking up a topic or
 /// subscribing on a topic
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Message {
     /// Basic pulsar command, as defined in Pulsar's protobuf file
     pub command: BaseCommand,
     /// payload for topic messages
     pub payload: Option<Payload>,
+}
+
+/// Shows the command with every credential it can carry blanked, and the
+/// payload as lengths only (see [`Payload`]): the connection logs whole
+/// messages at trace level.
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("command", &redacted(&self.command))
+            .field("payload", &self.payload)
+            .finish()
+    }
+}
+
+/// `command` with its credentials replaced by [`REDACTED`].
+fn redacted(command: &BaseCommand) -> BaseCommand {
+    let mut command = command.clone();
+    if let Some(connect) = command.connect.as_mut() {
+        connect.auth_data = connect.auth_data.as_ref().map(|_| REDACTED.to_vec());
+        connect.original_auth_data = connect.original_auth_data.as_ref().map(|_| redacted_text());
+    }
+    let auth = [
+        command
+            .auth_response
+            .as_mut()
+            .and_then(|a| a.response.as_mut()),
+        command
+            .auth_challenge
+            .as_mut()
+            .and_then(|a| a.challenge.as_mut()),
+    ];
+    for data in auth.into_iter().flatten() {
+        data.auth_data = data.auth_data.as_ref().map(|_| REDACTED.to_vec());
+    }
+    if let Some(lookup) = command.lookup_topic.as_mut() {
+        lookup.original_auth_data = lookup.original_auth_data.as_ref().map(|_| redacted_text());
+    }
+    if let Some(metadata) = command.partition_metadata.as_mut() {
+        metadata.original_auth_data = metadata
+            .original_auth_data
+            .as_ref()
+            .map(|_| redacted_text());
+    }
+    command
+}
+
+/// What a redacted credential reads as.
+const REDACTED: &[u8] = b"<redacted>";
+
+fn redacted_text() -> String {
+    String::from_utf8_lossy(REDACTED).into_owned()
 }
 
 impl Message {
@@ -484,12 +535,23 @@ impl asynchronous_codec::Decoder for Codec {
 }
 
 /// message payload
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Payload {
     /// message metadata added by Pulsar
     pub metadata: Metadata,
     /// raw message data
     pub data: Vec<u8>,
+}
+
+/// Lengths only: the data and the metadata (properties, keys) are
+/// publisher-written tenant content.
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Payload")
+            .field("data_len", &self.data.len())
+            .field("properties_len", &self.metadata.properties.len())
+            .finish_non_exhaustive()
+    }
 }
 
 struct CommandFrame<'a> {
@@ -642,9 +704,71 @@ mod tests {
         connection::RequestKey,
         message::{
             proto::{BaseCommand, CommandSendError, ServerError},
-            Codec, Message,
+            Codec, Message, Metadata, Payload,
         },
     };
+
+    /// Trace logs `{:?}` whole messages: the Debug form must carry neither
+    /// a payload's bytes or properties nor any credential the command holds.
+    #[test]
+    fn debug_carries_no_payload_bytes_or_credentials() {
+        use crate::message::proto::{
+            AuthData, CommandAuthChallenge, CommandAuthResponse, CommandConnect,
+            CommandLookupTopic, CommandPartitionedTopicMetadata, KeyValue,
+        };
+        const MARKER: &str = "SECRET-MARKER-7f3a";
+        let message = Message {
+            command: BaseCommand {
+                connect: Some(CommandConnect {
+                    auth_data: Some(MARKER.as_bytes().to_vec()),
+                    original_auth_data: Some(MARKER.into()),
+                    ..Default::default()
+                }),
+                auth_response: Some(CommandAuthResponse {
+                    response: Some(AuthData {
+                        auth_data: Some(MARKER.as_bytes().to_vec()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                auth_challenge: Some(CommandAuthChallenge {
+                    challenge: Some(AuthData {
+                        auth_data: Some(MARKER.as_bytes().to_vec()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                partition_metadata: Some(CommandPartitionedTopicMetadata {
+                    original_auth_data: Some(MARKER.into()),
+                    ..Default::default()
+                }),
+                lookup_topic: Some(CommandLookupTopic {
+                    original_auth_data: Some(MARKER.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payload: Some(Payload {
+                metadata: Metadata {
+                    properties: vec![KeyValue {
+                        key: MARKER.into(),
+                        value: MARKER.into(),
+                    }],
+                    ..Default::default()
+                },
+                data: MARKER.as_bytes().to_vec(),
+            }),
+        };
+        let decimal = format!("{:?}", &MARKER.as_bytes()[..6]);
+        let decimal = decimal.trim_matches(|c| c == '[' || c == ']');
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(MARKER), "{debug}");
+        assert!(!debug.contains(decimal), "{debug}");
+        assert!(
+            debug.contains("connect"),
+            "the command is still shown: {debug}"
+        );
+    }
 
     #[test]
     fn send_persistence_error_is_handled_as_producer_close() {
