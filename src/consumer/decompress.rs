@@ -85,15 +85,20 @@ pub(crate) fn decode_payload(
         };
         return Ok(vec![(message_id, payload)]);
     };
+    // A batch of no members would deliver nothing, so the message would be
+    // neither acknowledged nor refused and hold a permit forever.
+    let Ok(count @ 1..) = u32::try_from(count) else {
+        let reason = undecodable(format!("batch declares {count} messages"));
+        return Err(Box::new((payload, reason)));
+    };
     let table = decompressed.as_deref().unwrap_or(&payload.data);
-    match parse_batched_message(count as u32, table) {
-        Ok(members) => Ok(BatchedMessageIterator::from_members(
-            message_id,
-            payload.metadata,
-            count as u32,
-            members,
-        )
-        .collect()),
+    match parse_batched_message(count, table) {
+        Ok(members) => {
+            Ok(
+                BatchedMessageIterator::from_members(message_id, payload.metadata, count, members)
+                    .collect(),
+            )
+        }
         Err(err) => Err(Box::new((payload, undecodable(err)))),
     }
 }
@@ -590,5 +595,73 @@ mod tests {
         let members = decode_payload(Default::default(), payload, LIMIT).unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].1.data, b"abc".to_vec());
+    }
+
+    /// A batch that declares no members (or a negative count) would decode
+    /// to NOTHING: no payload is delivered, so the message is never acked or
+    /// refused and holds a permit forever. Refused as undecodable instead,
+    /// with the bytes as received, so the engine settles it.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn a_batch_declaring_no_members_is_refused_with_the_original_bytes() {
+        use crate::message::{proto::SingleMessageMetadata, BatchedMessage};
+        let mut table = Vec::new();
+        BatchedMessage {
+            metadata: SingleMessageMetadata {
+                payload_size: 3,
+                ..Default::default()
+            },
+            payload: b"one".to_vec(),
+        }
+        .serialize(&mut table);
+        let compressed = zstd::encode_all(&table[..], 3).unwrap();
+        for count in [0, -1, i32::MIN] {
+            for (data, compression, size) in [
+                (table.clone(), None, None),
+                (
+                    compressed.clone(),
+                    Some(proto::CompressionType::Zstd),
+                    Some(table.len() as u32),
+                ),
+            ] {
+                let payload = batch_payload(data.clone(), compression, size, count);
+                let (back, reason) =
+                    *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+                assert!(
+                    matches!(reason, DecodeRefusal::Undecodable(_)),
+                    "{count}: {reason:?}"
+                );
+                assert_eq!(back.data, data, "{count}: the bytes as received come back");
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever a publisher puts in the codec, declared size, batch count
+        /// and body, decoding never panics, a refusal hands back the bytes
+        /// exactly as received, and success yields at least one payload (an
+        /// empty success would leave the message unsettled).
+        #[test]
+        fn decode_payload_never_panics_and_refusals_carry_the_original_bytes(
+            codec in proptest::option::of(-2i32..8),
+            declared in proptest::option::of(proptest::prelude::any::<u32>()),
+            count in proptest::option::of(-3i32..6),
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let payload = crate::Payload {
+                metadata: crate::message::Metadata {
+                    producer_name: "prop".into(),
+                    num_messages_in_batch: count,
+                    compression: codec,
+                    uncompressed_size: declared,
+                    ..Default::default()
+                },
+                data: data.clone(),
+            };
+            match decode_payload(Default::default(), payload, LIMIT) {
+                Ok(members) => proptest::prop_assert!(!members.is_empty()),
+                Err(refused) => proptest::prop_assert_eq!(&refused.0.data, &data),
+            }
+        }
     }
 }
