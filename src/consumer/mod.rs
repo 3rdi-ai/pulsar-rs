@@ -1995,6 +1995,15 @@ mod tests {
             assert_eq!(message.payload.data, format!("m{i}").into_bytes());
             consumer.ack(&message).await.unwrap();
         }
+        // A single-active-consumer subscription is resubscribed once to
+        // reset the broker's window a non-positive count corrupted; Shared
+        // never is (the broker skips the entry).
+        let expected = u64::from(count <= 0 && sub_type != SubType::Shared);
+        assert_eq!(
+            forced_resubscribes(&consumer),
+            expected,
+            "{count} {sub_type:?}"
+        );
     }
 
     #[tokio::test]
@@ -2009,12 +2018,181 @@ mod tests {
 
     /// A negative count is refused and acknowledged, and on an Exclusive
     /// subscription (whose dispatcher credits the broker window instead of
-    /// debiting it) ordinary messages keep flowing. Larger negative counts
-    /// (`i32::MIN`) can still stall the broker's window: a producer-trust
-    /// limit, documented in FORK.md.
+    /// debiting it) ordinary messages keep flowing; the consumer still
+    /// resubscribes once to reset the window it drifted.
     #[tokio::test]
     async fn a_batch_declaring_minus_one_members_does_not_stall_dispatch() {
         ordinary_messages_flow_after_a_declared_count(-1, SubType::Exclusive).await;
+    }
+
+    /// How many forced resubscribes a single-topic consumer's engine scheduled.
+    fn forced_resubscribes<T: DeserializeMessage>(consumer: &Consumer<T, TokioExecutor>) -> u64 {
+        match &consumer.inner {
+            InnerConsumer::Single(c) => c
+                .forced_resubscribes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            _ => panic!("one topic builds a single consumer"),
+        }
+    }
+
+    /// `i32::MIN` overflows a single-active-consumer dispatcher's permit
+    /// window: once the refused entry is acknowledged the consumer
+    /// resubscribes (after a backoff), which resets the window, so ordinary
+    /// messages flow again.
+    #[tokio::test]
+    async fn a_batch_declaring_i32_min_members_recovers_an_exclusive_subscription() {
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_declaring_i32_min_members_recovers_a_failover_subscription() {
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Failover).await;
+    }
+
+    /// A connection error mid-window: the old session's messages still in
+    /// the engine's channels are dropped, not delivered and not debited
+    /// against the new session's window, so nothing reaches the consumer
+    /// twice and the broker's permits for it stay within `batch_size`.
+    #[tokio::test]
+    async fn a_reconnect_drops_the_old_sessions_messages() {
+        const BATCH: u32 = 10;
+        let topic = format!("reconnect_generation_{}", rand::random::<u32>());
+        let producer_client = crate::test_utils::new_pulsar().await;
+        let client = crate::test_utils::new_pulsar().await;
+        let mut producer = producer_client
+            .producer()
+            .with_topic(&topic)
+            .build()
+            .await
+            .unwrap();
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("generation")
+            .with_subscription_type(SubType::Exclusive)
+            .with_batch_size(BATCH)
+            .with_options(ConsumerOptions::default().with_receiver_queue_size(1))
+            .build()
+            .await
+            .unwrap();
+        let connection = match &mut consumer.inner {
+            InnerConsumer::Single(c) => c.connection().await.unwrap(),
+            _ => panic!("one topic builds a single consumer"),
+        };
+        let before = crate::test_utils::consumer_stats_when(&topic, "generation", |_| true).await;
+
+        for i in 0..BATCH {
+            producer
+                .send_non_blocking(format!("m{i}").into_bytes())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        // The broker dispatched the whole window: two messages sit in the
+        // receive queue, the engine waits to queue a third, the rest wait
+        // in its channel.
+        crate::test_utils::consumer_stats_when(&topic, "generation", |c| {
+            c["availablePermits"] == 0 && c["msgOutCounter"] == BATCH
+        })
+        .await;
+        connection.fail_for_test();
+        // Unblocks the engine, which then sees the failed connection.
+        let early = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(early.payload.data, b"m0".to_vec());
+        crate::test_utils::consumer_stats_when(&topic, "generation", |c| {
+            c["connectedSince"] != before["connectedSince"]
+        })
+        .await;
+
+        producer
+            .send_non_blocking(b"end".to_vec())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        loop {
+            let message = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT)
+                .await
+                .unwrap_or_else(|e| panic!("after {seen:?}: {e}"));
+            consumer.ack(&message).await.unwrap();
+            let data = String::from_utf8(message.payload.data.clone()).unwrap();
+            if data == "end" {
+                break;
+            }
+            seen.push(data);
+        }
+        // m0 was handed out before the reconnect and never acknowledged, so
+        // the broker redelivers it once; every other message arrives once.
+        let expected: Vec<String> = (0..BATCH).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            seen, expected,
+            "each message exactly once after the reconnect"
+        );
+
+        // At rest the engine's window is between half and all of BATCH and
+        // the broker's permits equal it; a debited stale message would
+        // leave the broker holding more.
+        let stats = crate::test_utils::consumer_stats_when(&topic, "generation", |c| {
+            c["availablePermits"]
+                .as_i64()
+                .is_some_and(|p| p >= i64::from(BATCH / 2))
+        })
+        .await;
+        let permits = stats["availablePermits"].as_i64().unwrap();
+        assert!(
+            permits <= i64::from(BATCH),
+            "{permits} permits for a window of {BATCH}"
+        );
+    }
+
+    /// A non-positive count whose dead-letter send FAILS leaves the entry
+    /// unacknowledged, and no resubscribe is scheduled: resubscribing would
+    /// redeliver it, refuse it again and fail again, in a loop.
+    #[tokio::test]
+    async fn a_failed_dead_letter_send_schedules_no_resubscribe() {
+        let topic = format!("forged_dlq_fails_{}", rand::random::<u32>());
+        let client = crate::test_utils::new_pulsar().await;
+        let mut producer = client.producer().with_topic(&topic).build().await.unwrap();
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("forged-dlq-fails")
+            .with_subscription_type(SubType::Exclusive)
+            .with_dead_letter_policy(DeadLetterPolicy {
+                max_redeliver_count: 3,
+                dead_letter_topic: format!("persistent://no-such-tenant-{topic}/ns/dlq"),
+            })
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        producer
+            .send_forged(producer::ProducerMessage {
+                payload: b"one".to_vec(),
+                num_messages_in_batch: Some(i32::MIN),
+                ..Default::default()
+            })
+            .await
+            .await
+            .unwrap();
+        let failed = timeout(Duration::from_secs(120), consumer.next())
+            .await
+            .expect("the failed dead-letter send must surface")
+            .expect("stream open");
+        assert!(
+            matches!(&failed, Err(e) if !matches!(e, Error::Consumer(ConsumerError::Refused { .. }))),
+            "{:?}",
+            failed.map(|m| m.payload.data.len())
+        );
+        // The engine decides before it queues the error, so this is final.
+        assert_eq!(forced_resubscribes(&consumer), 0);
     }
 
     /// A batch whose members' envelope copies pass a configured
@@ -2055,11 +2233,18 @@ mod tests {
             .await
             .expect("the batch must surface")
             .expect("stream open");
-        assert!(
-            matches!(first, Err(Error::Consumer(ConsumerError::Refused { .. }))),
-            "{:?}",
-            first.map(|m| m.payload.data.len())
-        );
+        match first {
+            Err(Error::Consumer(ConsumerError::Refused {
+                reason: crate::error::DecodeRefusal::Undecodable(why),
+                ..
+            })) => assert!(
+                why.contains(&format!(
+                    "{MIN_MAX_BATCH_ENVELOPE_BYTES}-byte envelope bound"
+                )),
+                "the refusal names the envelope bound: {why}"
+            ),
+            other => panic!("{:?}", other.map(|m| m.payload.data.len())),
+        }
     }
 
     /// A configured `max_queued_bytes` reaches the consumer's receive queue.

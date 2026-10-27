@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -35,8 +38,10 @@ use crate::{
 /// it), so the window mirrors the broker's and the next flow re-grants it.
 /// Zero or negative is booked as 1. The broker's window then drifts from
 /// this one (a single-active-consumer dispatcher credits a negative count,
-/// and `i32::MIN` overflows it), which no client booking repairs: the
-/// publisher trust boundary (mesh + publish authorization) is the defence.
+/// and `i32::MIN` overflows it), which no client booking repairs: on
+/// Exclusive/Failover the engine resubscribes (see
+/// [`forged_count_corrupts_window`]); on Shared the publisher trust boundary
+/// (mesh + publish authorization) is the defence.
 fn permits_consumed(num_messages_in_batch: Option<i32>) -> i64 {
     i64::from(num_messages_in_batch.unwrap_or(1)).max(1)
 }
@@ -62,6 +67,36 @@ const NON_POSITIVE_COUNT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// last one was logged.
 fn warn_due(last: Option<Instant>, now: Instant) -> bool {
     !matches!(last, Some(last) if now.saturating_duration_since(last) < NON_POSITIVE_COUNT_WARN_INTERVAL)
+}
+
+/// The first forced-resubscribe delay, and the most it backs off to: the
+/// Java client's reconnection backoff (`initialBackoffInterval` 100 ms,
+/// `maxBackoffInterval` 60 s). One forged entry on an honest subscription
+/// is recovered from within 100 ms; a publisher forging them continuously
+/// gets at most one resubscribe a minute.
+const FORCED_RESUBSCRIBE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const FORCED_RESUBSCRIBE_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A forced resubscribe this long after the previous one starts the backoff
+/// over: past twice the cap, so a steady stream of forged entries (one per
+/// capped delay) never resets it.
+const FORCED_RESUBSCRIBE_RESET_AFTER: Duration = Duration::from_secs(120);
+
+/// The delay before the forced resubscribe numbered `attempt` (from 0):
+/// doubling from the initial backoff, capped.
+fn forced_resubscribe_backoff(attempt: u32) -> Duration {
+    FORCED_RESUBSCRIBE_INITIAL_BACKOFF
+        .saturating_mul(2u32.saturating_pow(attempt))
+        .min(FORCED_RESUBSCRIBE_MAX_BACKOFF)
+}
+
+/// Whether an acknowledged entry declaring `num_messages_in_batch` left the
+/// broker's permit window corrupt for this subscription type, so only a
+/// fresh subscription (a new broker-side consumer) restores it. A
+/// single-active-consumer dispatcher credits a non-positive count and
+/// `i32::MIN` overflows its window; Shared skips the entry.
+fn forged_count_corrupts_window(sub_type: SubType, num_messages_in_batch: Option<i32>) -> bool {
+    matches!(sub_type, SubType::Exclusive | SubType::Failover)
+        && matches!(num_messages_in_batch, Some(..=0))
 }
 
 const SYSTEM_PROPERTY_REAL_TOPIC: &str = "REAL_TOPIC";
@@ -97,6 +132,19 @@ pub struct ConsumerEngine<Exe: Executor> {
     unacked_messages: HashMap<MessageIdData, Instant>,
     dead_letter_policy: Option<DeadLetterPolicy>,
     options: ConsumerOptions,
+    /// How many forced resubscribes have been scheduled.
+    forced_resubscribes: Arc<AtomicU64>,
+    /// The current subscription session: bumped by every resubscribe, in
+    /// step with the receive queue's. A message from an older session is
+    /// dropped (the broker redelivers it on this one, which never charged
+    /// a permit for it), as the Java client's `clearReceiverQueue`.
+    generation: u64,
+    /// When a forced resubscribe is due, if one is scheduled.
+    forced_resubscribe_at: Option<Instant>,
+    /// The backoff step of the next forced resubscribe.
+    forced_resubscribe_attempt: u32,
+    /// When the last forced resubscribe was scheduled.
+    last_forced_resubscribe: Option<Instant>,
 }
 
 impl<Exe: Executor> ConsumerEngine<Exe> {
@@ -138,7 +186,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             unacked_messages: HashMap::new(),
             dead_letter_policy,
             options,
+            forced_resubscribes: Arc::new(AtomicU64::new(0)),
+            generation: 0,
+            forced_resubscribe_at: None,
+            forced_resubscribe_attempt: 0,
+            last_forced_resubscribe: None,
         }
+    }
+
+    /// The count of forced resubscribes scheduled, shared with the consumer.
+    #[cfg(test)]
+    pub(crate) fn forced_resubscribes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.forced_resubscribes)
     }
 
     fn register_source<E, M>(&self, mut rx: mpsc::UnboundedReceiver<E>, mapper: M) -> Result<(), ()>
@@ -184,11 +243,20 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 }
             }
 
+            if self
+                .forced_resubscribe_at
+                .is_some_and(|due| Instant::now() >= due)
+            {
+                self.forced_resubscribe_at = None;
+                self.reconnect().await?;
+            }
+
             if let Some(messages_rx) = self.messages_rx.take() {
-                self.register_source(messages_rx, |msg| EngineEvent::Message(msg))
-                    .map_err(|_| {
-                        Error::Custom(String::from("Error registering messages_rx source"))
-                    })?;
+                let generation = self.generation;
+                self.register_source(messages_rx, move |msg| {
+                    EngineEvent::Message(generation, msg)
+                })
+                .map_err(|_| Error::Custom(String::from("Error registering messages_rx source")))?;
             }
 
             if let Some(engine_rx) = self.engine_rx.take() {
@@ -240,7 +308,14 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.remaining_messages += i64::from(permits);
             }
 
-            match Self::timeout(self.event_rx.next(), Duration::from_secs(1)).await {
+            // Wake for a due forced resubscribe, else at least every second.
+            let wait = self
+                .forced_resubscribe_at
+                .map_or(Duration::from_secs(1), |due| {
+                    due.saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(1))
+                });
+            match Self::timeout(self.event_rx.next(), wait).await {
                 Err(_) => {
                     // If you are reading this comment, you may have an issue where you have
                     // received a batched message that is greater that the batch
@@ -255,7 +330,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     // ```
                     debug!("consumer engine: timeout (1s)");
                 }
-                Ok(Some(EngineEvent::Message(msg))) => {
+                Ok(Some(EngineEvent::Message(generation, _))) if generation != self.generation => {
+                    // A replaced session's message (or its end): neither
+                    // delivered nor debited.
+                    trace!("consumer engine: dropped a message from session {generation}");
+                }
+                Ok(Some(EngineEvent::Message(_, msg))) => {
                     // The command only: the payload is publisher bytes.
                     debug!(
                         "consumer engine: received message, {:?}",
@@ -400,8 +480,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
+    /// Acknowledges `message_id`; whether the ack reached the connection.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    async fn ack(&mut self, message_id: MessageIdData, cumulative: bool) {
+    async fn ack(&mut self, message_id: MessageIdData, cumulative: bool) -> bool {
         // FIXME: this does not handle cumulative acks
         self.unacked_messages.remove(&message_id);
         let res = self
@@ -412,6 +493,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         if res.is_err() {
             error!("ack error: {:?}", res);
         }
+        res.is_ok()
     }
 
     /// Process the message. Returns `true` if there are more messages to process
@@ -612,6 +694,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         reason: DecodeRefusal,
     ) -> Error {
         let message_id = message.message_id;
+        let declared_count = payload.metadata.num_messages_in_batch;
         warn!(
             "{}: refusing a message ({}): {reason}",
             self.debug_format(),
@@ -652,7 +735,14 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
             None => false,
         };
-        self.ack(message_id, false).await;
+        // Only once the entry is settled: resubscribing before (or after a
+        // failed dead-letter send, which returned above) would redeliver
+        // it, refuse it again and resubscribe again, in a loop.
+        if self.ack(message_id, false).await
+            && forged_count_corrupts_window(self.sub_type, declared_count)
+        {
+            self.schedule_forced_resubscribe();
+        }
         Error::Consumer(ConsumerError::Refused {
             reason,
             dead_lettered,
@@ -679,9 +769,38 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         Ok(())
     }
 
+    /// Schedules a resubscribe, backing off per consumer, unless one is
+    /// already pending (it resets the window for every entry before it).
+    /// The ack goes out before the resubscribe's `CloseConsumer` on the same
+    /// connection, so the broker settles the entry before the new session.
+    fn schedule_forced_resubscribe(&mut self) {
+        if self.forced_resubscribe_at.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if self.last_forced_resubscribe.is_some_and(|last| {
+            now.saturating_duration_since(last) > FORCED_RESUBSCRIBE_RESET_AFTER
+        }) {
+            self.forced_resubscribe_attempt = 0;
+        }
+        let delay = forced_resubscribe_backoff(self.forced_resubscribe_attempt);
+        self.forced_resubscribe_attempt = self.forced_resubscribe_attempt.saturating_add(1);
+        self.last_forced_resubscribe = Some(now);
+        self.forced_resubscribe_at = Some(now + delay);
+        let scheduled = self.forced_resubscribes.fetch_add(1, Ordering::SeqCst) + 1;
+        warn!(
+            "{}: a non-positive batch count corrupted the broker's permit window; resubscribing in {delay:?} (forced resubscribe #{scheduled})",
+            self.debug_format()
+        );
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
+
+        // A new session before the old one is closed: whatever it already
+        // sent, queued or not, is dropped from here on.
+        self.generation = self.tx.new_generation();
 
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
@@ -821,5 +940,43 @@ mod tests {
             warn_due(Some(t0), t0 + NON_POSITIVE_COUNT_WARN_INTERVAL),
             "one at the interval is"
         );
+    }
+
+    /// The forced-resubscribe delay doubles from 100 ms and caps at 60 s,
+    /// never overflowing however many attempts.
+    #[test]
+    fn the_forced_resubscribe_backoff_doubles_and_caps() {
+        assert_eq!(forced_resubscribe_backoff(0), Duration::from_millis(100));
+        assert_eq!(forced_resubscribe_backoff(1), Duration::from_millis(200));
+        assert_eq!(forced_resubscribe_backoff(9), Duration::from_millis(51_200));
+        assert_eq!(forced_resubscribe_backoff(10), Duration::from_secs(60));
+        assert_eq!(
+            forced_resubscribe_backoff(u32::MAX),
+            Duration::from_secs(60)
+        );
+        assert!(FORCED_RESUBSCRIBE_RESET_AFTER > FORCED_RESUBSCRIBE_MAX_BACKOFF);
+    }
+
+    /// Only a single-active-consumer subscription with a non-positive count
+    /// needs the forced resubscribe.
+    #[test]
+    fn only_a_single_active_consumer_window_needs_a_resubscribe() {
+        for sub_type in [SubType::Exclusive, SubType::Failover] {
+            for count in [0, -1, i32::MIN] {
+                assert!(
+                    forged_count_corrupts_window(sub_type, Some(count)),
+                    "{sub_type:?} {count}"
+                );
+            }
+            assert!(!forged_count_corrupts_window(sub_type, Some(1)));
+            assert!(!forged_count_corrupts_window(sub_type, None));
+        }
+        for count in [0, -1, i32::MIN] {
+            assert!(!forged_count_corrupts_window(SubType::Shared, Some(count)));
+            assert!(!forged_count_corrupts_window(
+                SubType::KeyShared,
+                Some(count)
+            ));
+        }
     }
 }

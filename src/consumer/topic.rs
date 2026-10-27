@@ -42,6 +42,9 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
     pub(super) last_message_received: Option<DateTime<Utc>>,
     pub(super) messages_received: u64,
+    /// How many forced resubscribes the engine has scheduled.
+    #[cfg(test)]
+    pub(crate) forced_resubscribes: Arc<AtomicU64>,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
@@ -133,6 +136,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy.clone(),
             options.clone(),
         );
+        #[cfg(test)]
+        let forced_resubscribes = c.forced_resubscribes();
         let engine_task = client.executor.spawn(Box::pin(async move {
             c.engine()
                 .map(|res| {
@@ -154,6 +159,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
             last_message_received: None,
             messages_received: 0,
+            #[cfg(test)]
+            forced_resubscribes,
         })
     }
 

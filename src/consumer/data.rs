@@ -11,7 +11,9 @@ use crate::{
 pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageIdData, Payload), Error>>;
 
 pub enum EngineEvent<Exe: Executor> {
-    Message(Option<RawMessage>),
+    /// A message from the subscription session (generation) that registered
+    /// its source.
+    Message(u64, Option<RawMessage>),
     EngineMessage(Option<EngineMessage<Exe>>),
 }
 

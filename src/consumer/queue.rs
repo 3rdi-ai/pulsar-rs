@@ -11,7 +11,10 @@
 
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -33,6 +36,16 @@ fn bytes_of(item: &Item) -> usize {
     })
 }
 
+/// One queued item with the bytes reserved for it and the subscription
+/// session (generation) that received it: the receiver releases exactly the
+/// reserved bytes, measured once on send, and drops an item from a session
+/// the engine has since replaced (the broker redelivers it on the new one).
+struct Queued {
+    generation: u64,
+    bytes: usize,
+    item: Item,
+}
+
 #[derive(Default)]
 struct State {
     queued: usize,
@@ -45,6 +58,8 @@ struct State {
 
 struct Budget {
     max: usize,
+    /// The engine's current subscription session; items from an older one are stale.
+    generation: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -103,7 +118,7 @@ impl Drop for Reservation<'_> {
 
 /// The engine's end of the queue.
 pub(crate) struct QueueSender {
-    tx: mpsc::Sender<Item>,
+    tx: mpsc::Sender<Queued>,
     budget: Arc<Budget>,
 }
 
@@ -121,16 +136,30 @@ impl QueueSender {
         // flush can stay pending AFTER the item is queued, and a send
         // cancelled there would give back bytes the receiver releases too.
         futures::future::poll_fn(|cx| self.tx.poll_ready(cx)).await?;
-        self.tx.start_send(item)?;
+        let queued = Queued {
+            generation: budget.generation.load(Ordering::Acquire),
+            bytes,
+            item,
+        };
+        self.tx.start_send(queued)?;
         // Queued: the receiver releases the bytes when it takes the item.
         std::mem::forget(reservation);
         Ok(())
+    }
+
+    /// Starts a new subscription session: every item queued so far, and
+    /// every one sent before the next call, is from the old session and the
+    /// receiver drops it (releasing its bytes) instead of yielding it. An
+    /// error item is still yielded: it carries no message the broker
+    /// redelivers.
+    pub(crate) fn new_generation(&self) -> u64 {
+        self.budget.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
 /// The consumer's end of the queue.
 pub(crate) struct QueueReceiver {
-    rx: mpsc::Receiver<Item>,
+    rx: mpsc::Receiver<Queued>,
     budget: Arc<Budget>,
 }
 
@@ -161,11 +190,23 @@ impl Stream for QueueReceiver {
     type Item = Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Item>> {
-        let polled = Pin::new(&mut self.rx).poll_next(cx);
-        if let Poll::Ready(Some(item)) = &polled {
-            self.budget.release(bytes_of(item));
+        loop {
+            match Pin::new(&mut self.rx).poll_next(cx) {
+                Poll::Ready(Some(Queued {
+                    generation,
+                    bytes,
+                    item,
+                })) => {
+                    self.budget.release(bytes);
+                    let current = self.budget.generation.load(Ordering::Acquire);
+                    if generation == current || item.is_err() {
+                        return Poll::Ready(Some(item));
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        polled
     }
 }
 
@@ -174,8 +215,9 @@ impl Stream for QueueReceiver {
 /// not deadlock: an empty queue always admits one item, so it holds one
 /// item at a time.
 pub(crate) fn receive_queue(capacity: usize, max_bytes: usize) -> (QueueSender, QueueReceiver) {
-    let (tx, rx) = mpsc::channel(capacity);
+    let (tx, rx) = mpsc::channel::<Queued>(capacity);
     let budget = Arc::new(Budget {
+        generation: AtomicU64::new(0),
         max: max_bytes,
         state: Mutex::new(State::default()),
     });
@@ -335,5 +377,74 @@ mod tests {
             Poll::Ready(Ok(())) => panic!("a send to a dropped consumer succeeded"),
             Poll::Pending => panic!("the send still waits on a dropped consumer"),
         }
+    }
+
+    /// Items queued before `new_generation` are from a replaced session:
+    /// the receiver drops them, releasing their bytes, and yields only the
+    /// new session's items. An error item is yielded whatever its session.
+    #[test]
+    fn a_replaced_sessions_items_are_dropped_and_released() {
+        let (mut tx, mut rx) = receive_queue(1000, 1024 * 1024);
+        tx.send(payload(100)).now_or_never().unwrap().unwrap();
+        tx.send(Err(Error::Custom("old session".to_string())))
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        tx.send(payload(200)).now_or_never().unwrap().unwrap();
+        assert_eq!(tx.new_generation(), 1);
+        tx.send(payload(300)).now_or_never().unwrap().unwrap();
+
+        let first = rx.next().now_or_never().flatten().expect("an item");
+        assert!(first.is_err(), "the error item is yielded");
+        let second = rx.next().now_or_never().flatten().expect("an item");
+        assert_eq!(
+            second.unwrap().1.data.len(),
+            300,
+            "only the new session's payload"
+        );
+        assert_eq!(
+            rx.queued_bytes(),
+            0,
+            "the dropped items' bytes are released"
+        );
+        assert!(rx.next().now_or_never().is_none(), "nothing else is queued");
+    }
+
+    /// Every way an item leaves the queue gives back exactly the bytes it
+    /// reserved, measured once on send: taken, dropped as stale, a send
+    /// cancelled before queueing, and a send failing on a closed channel.
+    #[test]
+    fn release_equals_reserve_on_every_path() {
+        // Taken.
+        let (mut tx, mut rx) = receive_queue(1000, 1024 * 1024);
+        tx.send(payload(123)).now_or_never().unwrap().unwrap();
+        assert_eq!(rx.queued_bytes(), bytes_of(&payload(123)));
+        assert!(rx.next().now_or_never().flatten().is_some());
+        assert_eq!(rx.queued_bytes(), 0, "taken");
+
+        // Dropped as stale: the poll that skips it returns Pending.
+        tx.send(payload(456)).now_or_never().unwrap().unwrap();
+        tx.new_generation();
+        assert!(
+            rx.next().now_or_never().is_none(),
+            "the stale item is not yielded"
+        );
+        assert_eq!(rx.queued_bytes(), 0, "stale");
+
+        // Cancelled: `mpsc::channel(0)` holds one item per sender.
+        let (mut tx, mut rx) = receive_queue(0, 1024 * 1024);
+        tx.send(payload(10)).now_or_never().unwrap().unwrap();
+        assert!(
+            tx.send(payload(20)).now_or_never().is_none(),
+            "the channel is full"
+        );
+        assert_eq!(rx.queued_bytes(), bytes_of(&payload(10)), "cancelled");
+        assert!(rx.next().now_or_never().flatten().is_some());
+        assert_eq!(rx.queued_bytes(), 0);
+
+        // Failed: the channel closed under a live receiver.
+        rx.rx.close();
+        assert!(matches!(tx.send(payload(30)).now_or_never(), Some(Err(_))));
+        assert_eq!(rx.queued_bytes(), 0, "failed");
     }
 }

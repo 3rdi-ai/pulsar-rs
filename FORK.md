@@ -37,6 +37,38 @@ The cap is `ConsumerOptions::max_decompressed_size` (default
 `DEFAULT_MAX_DECOMPRESSED_SIZE`, 5 MiB), so a topic with large legitimate
 messages can raise it on purpose.
 
+## v6.9.1-3rdi.9
+
+Supersedes `v6.9.1-3rdi.8` (left in place, not deleted). No new public
+items.
+
+- **Session generations** (fixes a pre-existing upstream defect): every
+  resubscribe (a connection error, a broker `CloseConsumer`, or the forced
+  resubscribe below) starts a new session. Messages the old session already
+  dispatched, still in the engine's channel or already in the receive queue,
+  are dropped: not delivered and not debited against the new session's
+  permit window; the broker redelivers them on the new session (as the Java
+  client's `clearReceiverQueue`). Before this, each reconnect over-granted
+  the broker up to `batch_size` permits and delivered those messages twice.
+  A message the application had already taken before the reconnect and not
+  acknowledged is still redelivered (at-least-once, as before). An error
+  item already queued (a refusal notice) is still yielded.
+- **Exclusive/Failover recovery from a non-positive batch count**: once the
+  refused entry is acknowledged, the consumer resubscribes, which gives the
+  broker a fresh permit window (`i32::MIN` no longer stalls the
+  subscription). The resubscribe backs off per consumer: 100 ms, doubling,
+  capped at 60 s (the Java client's reconnection backoff), and starts over
+  only after 120 s without one, so a publisher forging entries gets at most
+  about one resubscribe a minute. A failed dead-letter send leaves the entry
+  unacknowledged and schedules no resubscribe (which would redeliver, refuse
+  and resubscribe in a loop); a failed ack schedules none either. The ack
+  and the resubscribe's `CloseConsumer` go out in that order on the same
+  connection. **Shared** is unchanged: the broker skips such an entry, which
+  no client-side change can repair (the producer-trust statement under .8
+  stands).
+- **Receive queue**: each item is measured once, on send, and the receiver
+  releases exactly that (the measure travels with the item).
+
 ## v6.9.1-3rdi.8
 
 Supersedes `v6.9.1-3rdi.7` (left in place, not deleted). Fixes from the
@@ -80,12 +112,7 @@ security review of .7:
   is not positive is INFERRED from that behaviour, not read from the broker
   source. The defence is the publisher trust boundary: the mesh plus Pulsar
   publish authorization.
-- **Planned follow-ups** (a separate branch after .8): client-side recovery
-  for the Exclusive/Failover case (resubscribe with backoff, only after the
-  refusal's ack succeeds), with a session generation that drops stale
-  messages from a previous subscription (which also fixes the pre-existing
-  window drift after a connection error); and measuring each queued item
-  once instead of on admit and on release.
+  (Exclusive/Failover recovery: see `v6.9.1-3rdi.9`.)
 
 ## v6.9.1-3rdi.7
 

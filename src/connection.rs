@@ -1451,6 +1451,13 @@ impl<Exe: Executor> Connection<Exe> {
         !self.sender.error.is_set()
     }
 
+    /// Marks the connection failed, as a dropped socket does: its users
+    /// reconnect the next time they check it.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&self) {
+        self.sender.error.set(ConnectionError::Disconnected);
+    }
+
     /// whether the broker closed this producer on this connection
     pub fn is_producer_closed(&self, producer_id: u64) -> bool {
         self.sender
