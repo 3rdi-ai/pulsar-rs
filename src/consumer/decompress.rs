@@ -3,7 +3,9 @@
 //! (a decompression bomb). A message that would decompress past `limit`, or
 //! whose output does not match its declared `uncompressed_size`, is refused
 //! with a [`DecodeRefusal`] — a per-message error, never a panic and never
-//! an unbounded allocation.
+//! an unbounded allocation. A batch is likewise bounded: past
+//! `max_members` members, or when its members' copies of the envelope
+//! metadata would exceed `limit`, it is refused before it is split.
 
 use crate::{
     consumer::batched_message_iterator::BatchedMessageIterator,
@@ -14,6 +16,12 @@ use crate::{
 
 /// Pulsar's default broker `maxMessageSize` (5 MiB).
 pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 5 * 1024 * 1024;
+
+/// The default most members one batch may declare: ten times the member
+/// cap Pulsar producers default to (`batchingMaxMessages`, 1000), so no
+/// real batch is refused, while one batch can still only materialise a
+/// bounded number of payloads.
+pub const DEFAULT_MAX_BATCH_MEMBERS: u32 = 10_000;
 
 fn undecodable(e: impl std::fmt::Display) -> DecodeRefusal {
     DecodeRefusal::Undecodable(e.to_string())
@@ -40,7 +48,8 @@ fn read_bounded(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>, Dec
 pub(crate) type Decoded = (proto::MessageIdData, Payload);
 
 /// Decodes one broker message into the payloads it carries: decompressed
-/// under `limit` and, for a batch envelope, split into its members.
+/// under `limit` and, for a batch envelope, split into at most
+/// `max_members` members.
 ///
 /// Every way the message can fail to decode (an unknown codec, a refused
 /// decompression, a member table that does not parse) is a [`DecodeRefusal`]
@@ -51,6 +60,7 @@ pub(crate) fn decode_payload(
     message_id: proto::MessageIdData,
     payload: Payload,
     limit: usize,
+    max_members: u32,
 ) -> Result<Vec<Decoded>, Box<(Payload, DecodeRefusal)>> {
     let compression = match payload.metadata.compression {
         None => proto::CompressionType::None,
@@ -91,6 +101,22 @@ pub(crate) fn decode_payload(
         let reason = undecodable(format!("batch declares {count} messages"));
         return Err(Box::new((payload, reason)));
     };
+    if count > max_members {
+        let reason = undecodable(format!(
+            "batch declares {count} messages, past the {max_members}-member cap"
+        ));
+        return Err(Box::new((payload, reason)));
+    }
+    // Every member carries a copy of the envelope metadata, which the
+    // frame alone bounds only to megabytes: the copies, not the member
+    // table, are what a small batch would amplify into an OOM.
+    let envelope = prost::Message::encoded_len(&payload.metadata);
+    if (count as usize).saturating_mul(envelope) > limit {
+        let reason = undecodable(format!(
+            "batch of {count} messages would copy its {envelope}-byte envelope past the {limit}-byte cap"
+        ));
+        return Err(Box::new((payload, reason)));
+    }
     let table = decompressed.as_deref().unwrap_or(&payload.data);
     match parse_batched_message(count, table) {
         Ok(members) => {
@@ -439,7 +465,13 @@ mod tests {
             },
             data: under,
         };
-        let members = decode_payload(Default::default(), payload, LIMIT).unwrap();
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap();
         assert_eq!(members.len(), 4);
         assert!(members.iter().all(|(_, p)| p.data.len() == LIMIT / 8));
     }
@@ -520,7 +552,13 @@ mod tests {
             Some(table.len() as u32),
             2,
         );
-        let (back, reason) = *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
@@ -566,16 +604,94 @@ mod tests {
         table.extend_from_slice(&(MARKER.len() as u32).to_be_bytes());
         table.extend_from_slice(&MARKER.repeat(64));
         let payload = batch_payload(table, None, None, 2);
-        let (_, reason) = *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+        let (_, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
         let reason = reason.to_string();
         assert!(!leaks(&reason), "{} bytes: {reason}", reason.len());
+    }
+
+    /// An uncompressed batch of `count` empty members (4 bytes each: a zero
+    /// `metadata_size`) under an envelope carrying a property of
+    /// `envelope_bytes`.
+    fn empty_members(count: usize, envelope_bytes: usize) -> crate::Payload {
+        let mut payload = batch_payload(vec![0u8; 4 * count], None, None, count as i32);
+        payload.metadata.properties.push(proto::KeyValue {
+            key: "k".into(),
+            value: "v".repeat(envelope_bytes),
+        });
+        payload
+    }
+
+    /// A 64 KiB envelope over 2000 empty members would clone 128 MiB of
+    /// metadata out of an 8000-byte table: refused, with the bytes.
+    #[test]
+    fn an_envelope_amplified_by_many_members_is_refused() {
+        let payload = empty_members(2000, 64 * 1024);
+        let data = payload.data.clone();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason, DecodeRefusal::Undecodable(_)),
+            "{reason:?}"
+        );
+        assert_eq!(back.data, data);
+    }
+
+    /// More members than the 10_000 default cap, however small the
+    /// envelope: refused, with the bytes.
+    #[test]
+    fn a_batch_past_the_member_cap_is_refused() {
+        let payload = empty_members(10_001, 0);
+        let data = payload.data.clone();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason, DecodeRefusal::Undecodable(_)),
+            "{reason:?}"
+        );
+        assert_eq!(back.data, data);
+    }
+
+    /// Exactly the default cap of members decodes, one payload each.
+    #[test]
+    fn a_batch_at_the_member_cap_decodes() {
+        let payload = empty_members(10_000, 0);
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap();
+        assert_eq!(members.len(), 10_000);
     }
 
     #[test]
     fn an_uncompressed_batch_with_a_corrupt_member_table_is_refused() {
         let table = vec![0xffu8; 64];
         let payload = batch_payload(table.clone(), None, None, 2);
-        let (back, reason) = *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
@@ -605,7 +721,13 @@ mod tests {
             Some(table.len() as u32),
             2,
         );
-        let members = decode_payload(Default::default(), payload, LIMIT).unwrap();
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap();
         let data: Vec<_> = members.iter().map(|(_, p)| p.data.clone()).collect();
         assert_eq!(data, vec![b"one".to_vec(), b"two".to_vec()]);
         assert_eq!(members[1].0.batch_index, Some(1));
@@ -616,7 +738,13 @@ mod tests {
         let mut payload = batch_payload(b"abc".to_vec(), None, None, 1);
         payload.metadata.num_messages_in_batch = None;
         payload.metadata.compression = Some(99);
-        let (back, reason) = *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+        let (back, reason) = *decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap_err();
         assert!(
             matches!(reason, DecodeRefusal::Undecodable(_)),
             "{reason:?}"
@@ -628,7 +756,13 @@ mod tests {
     fn an_uncompressed_single_message_passes_through() {
         let mut payload = batch_payload(b"abc".to_vec(), None, None, 1);
         payload.metadata.num_messages_in_batch = None;
-        let members = decode_payload(Default::default(), payload, LIMIT).unwrap();
+        let members = decode_payload(
+            Default::default(),
+            payload,
+            LIMIT,
+            DEFAULT_MAX_BATCH_MEMBERS,
+        )
+        .unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].1.data, b"abc".to_vec());
     }
@@ -661,8 +795,13 @@ mod tests {
                 ),
             ] {
                 let payload = batch_payload(data.clone(), compression, size, count);
-                let (back, reason) =
-                    *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+                let (back, reason) = *decode_payload(
+                    Default::default(),
+                    payload,
+                    LIMIT,
+                    DEFAULT_MAX_BATCH_MEMBERS,
+                )
+                .unwrap_err();
                 assert!(
                     matches!(reason, DecodeRefusal::Undecodable(_)),
                     "{count}: {reason:?}"
@@ -699,7 +838,7 @@ mod tests {
                 },
                 data: data.clone(),
             };
-            match decode_payload(Default::default(), payload, LIMIT) {
+            match decode_payload(Default::default(), payload, LIMIT, DEFAULT_MAX_BATCH_MEMBERS) {
                 Ok(members) => proptest::prop_assert_eq!(
                     members.len(),
                     count.map_or(1, |c| c as usize)

@@ -21,7 +21,7 @@ use std::{
 pub use builder::ConsumerBuilder;
 use chrono::{DateTime, Utc};
 pub use data::{DeadLetterPolicy, EngineMessage};
-pub use decompress::DEFAULT_MAX_DECOMPRESSED_SIZE;
+pub use decompress::{DEFAULT_MAX_BATCH_MEMBERS, DEFAULT_MAX_DECOMPRESSED_SIZE};
 use futures::{
     future::try_join_all,
     task::{Context, Poll},

@@ -480,14 +480,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .options
             .max_decompressed_size
             .unwrap_or(super::decompress::DEFAULT_MAX_DECOMPRESSED_SIZE);
-        let payloads =
-            match super::decompress::decode_payload(message.message_id.clone(), payload, limit) {
-                Ok(payloads) => payloads,
-                Err(refused) => {
-                    let (payload, reason) = *refused;
-                    return Err(self.settle_refused(message, payload, reason).await);
-                }
-            };
+        let max_members = self
+            .options
+            .max_batch_members
+            .unwrap_or(super::decompress::DEFAULT_MAX_BATCH_MEMBERS);
+        let id = message.message_id.clone();
+        let payloads = match super::decompress::decode_payload(id, payload, limit, max_members) {
+            Ok(payloads) => payloads,
+            Err(refused) => {
+                let (payload, reason) = *refused;
+                return Err(self.settle_refused(message, payload, reason).await);
+            }
+        };
         for (message_id, payload) in payloads {
             match (message.redelivery_count, self.dead_letter_policy.clone()) {
                 (Some(redelivery_count), Some(dead_letter_policy))

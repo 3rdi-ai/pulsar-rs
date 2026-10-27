@@ -39,6 +39,11 @@ pub struct ConsumerOptions {
     /// refused and settled (dead-lettered or acknowledged), never decoded.
     /// Raise it on purpose for a topic with large legitimate messages.
     pub max_decompressed_size: Option<usize>,
+    /// The most members one batch may declare; `None` means
+    /// [`crate::consumer::DEFAULT_MAX_BATCH_MEMBERS`] (10_000, ten times
+    /// the producers' default batch). A batch past it is refused and
+    /// settled like any undecodable message.
+    pub max_batch_members: Option<u32>,
 }
 
 impl ConsumerOptions {
@@ -47,6 +52,14 @@ impl ConsumerOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_max_decompressed_size(mut self, bytes: usize) -> Self {
         self.max_decompressed_size = Some(bytes);
+        self
+    }
+
+    /// within options, sets the most members one batch may declare
+    /// (see [`ConsumerOptions::max_batch_members`])
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_max_batch_members(mut self, members: u32) -> Self {
+        self.max_batch_members = Some(members);
         self
     }
 

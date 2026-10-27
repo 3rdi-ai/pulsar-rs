@@ -13,12 +13,17 @@ pub struct BatchedMessageIterator {
 
 impl BatchedMessageIterator {
     /// The iterator over a batch whose member table is already parsed.
+    /// The envelope fields every member replaces with its own are dropped
+    /// here once, so they are not copied per member.
     pub(crate) fn from_members(
         message_id: MessageIdData,
-        metadata: Metadata,
+        mut metadata: Metadata,
         total_messages: u32,
         messages: Vec<BatchedMessage>,
     ) -> Self {
+        metadata.properties = Vec::new();
+        metadata.partition_key = None;
+        metadata.ordering_key = None;
         Self {
             messages: messages.into_iter(),
             message_id,
@@ -122,6 +127,7 @@ mod tests {
             },
             payload,
             usize::MAX,
+            crate::consumer::DEFAULT_MAX_BATCH_MEMBERS,
         )
         .unwrap();
 
