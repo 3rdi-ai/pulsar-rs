@@ -23,6 +23,19 @@ message surfaces as `ConsumerError::Io(InvalidData)` on the consumer stream,
 never a panic or an allocation past the cap (the Java client likewise discards
 a message whose uncompressed size exceeds the max).
 
+Since `v6.9.1-3rdi.3` a refused message is **settled**, never left unacked
+(an unacked refusal is redelivered on every reconnect and, on a Shared
+subscription, piles up until `maxUnackedMessagesPerConsumer` stalls the
+consumer). With a `DeadLetterPolicy` the message goes to the dead-letter topic
+as it arrived (still compressed), tagged `DECODE_REFUSAL` (`over_cap`,
+`size_mismatch` or `undecodable`), `ORIGINAL_COMPRESSION` and
+`ORIGINAL_UNCOMPRESSED_SIZE`; then it is acknowledged either way (a failed
+dead-letter send leaves it unacked for redelivery). The consumer stream yields
+the typed `ConsumerError::Refused { reason: DecodeRefusal, dead_lettered }`.
+The cap is `ConsumerOptions::max_decompressed_size` (default
+`DEFAULT_MAX_DECOMPRESSED_SIZE`, 5 MiB), so a topic with large legitimate
+messages can raise it on purpose.
+
 Releases are tagged `v<upstream>-3rdi.<n>`, e.g. `v6.9.1-3rdi.1`.
 
 ## When to drop it

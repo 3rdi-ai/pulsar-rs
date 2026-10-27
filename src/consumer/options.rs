@@ -33,9 +33,23 @@ pub struct ConsumerOptions {
     /// }
     /// ```
     pub initial_position: InitialPosition,
+    /// The most bytes one message (a whole batch envelope) may decompress
+    /// to; `None` means [`crate::consumer::DEFAULT_MAX_DECOMPRESSED_SIZE`]
+    /// (5 MiB, the broker's default `maxMessageSize`). A message past it is
+    /// refused and settled (dead-lettered or acknowledged), never decoded.
+    /// Raise it on purpose for a topic with large legitimate messages.
+    pub max_decompressed_size: Option<usize>,
 }
 
 impl ConsumerOptions {
+    /// within options, sets the most bytes one message may decompress to
+    /// (see [`ConsumerOptions::max_decompressed_size`])
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_max_decompressed_size(mut self, bytes: usize) -> Self {
+        self.max_decompressed_size = Some(bytes);
+        self
+    }
+
     /// within options, sets the priority level
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_priority_level(mut self, priority_level: i32) -> Self {
