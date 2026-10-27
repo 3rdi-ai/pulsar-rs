@@ -1920,6 +1920,87 @@ mod tests {
         consumer.ack(&msg).await.unwrap();
     }
 
+    /// The broker debits an entry's DECLARED `num_messages_in_batch` from
+    /// the consumer's permits, so the client must book the same debit and
+    /// grant it back, or the broker stops dispatching. Every ordinary
+    /// message published after the hostile entry must still arrive.
+    async fn ordinary_messages_flow_after_a_declared_count(count: i32) {
+        const BATCH: u32 = 10;
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("declared_count_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = client.producer().with_topic(&topic).build().await.unwrap();
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("declared")
+            .with_batch_size(BATCH)
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let mut table = Vec::new();
+        crate::message::BatchedMessage {
+            metadata: crate::message::proto::SingleMessageMetadata {
+                payload_size: 3,
+                ..Default::default()
+            },
+            payload: b"one".to_vec(),
+        }
+        .serialize(&mut table);
+        producer
+            .send_forged(producer::ProducerMessage {
+                payload: table,
+                num_messages_in_batch: Some(count),
+                ..Default::default()
+            })
+            .await
+            .await
+            .unwrap();
+        // The hostile entry surfaces (refused or delivered) before anything
+        // else is published, so the broker dispatched it alone.
+        let first = timeout(DEFAULT_RECV_TIMEOUT, consumer.next())
+            .await
+            .expect("the hostile entry must surface")
+            .expect("stream open");
+        if let Ok(message) = &first {
+            consumer.ack(message).await.unwrap();
+        }
+
+        for i in 0..2 * BATCH {
+            producer
+                .send_non_blocking(format!("m{i}").into_bytes())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        for i in 0..2 * BATCH {
+            let message = recv_within(&mut consumer, DEFAULT_RECV_TIMEOUT)
+                .await
+                .unwrap_or_else(|e| panic!("{count}: message {i}: {e}: dispatch stalled"));
+            assert_eq!(message.payload.data, format!("m{i}").into_bytes());
+            consumer.ack(&message).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_declaring_i32_max_members_does_not_stall_dispatch() {
+        ordinary_messages_flow_after_a_declared_count(i32::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_declaring_70000_members_does_not_stall_dispatch() {
+        ordinary_messages_flow_after_a_declared_count(70_000).await;
+    }
+
     /// Decodes to 8 MiB of zeros: past the 5 MiB default cap, tiny on the wire.
     #[cfg(feature = "zstd")]
     const BOMB_DECODED_LEN: usize = 8 * 1024 * 1024;

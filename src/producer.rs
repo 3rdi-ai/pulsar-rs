@@ -337,6 +337,16 @@ impl<Exe: Executor> Producer<Exe> {
         ProducerBuilder::new(pulsar)
     }
 
+    /// Sends `message` with its metadata exactly as given: tests forge
+    /// envelopes (a hostile `num_messages_in_batch`) through it.
+    #[cfg(test)]
+    pub(crate) async fn send_forged(&mut self, message: ProducerMessage) -> SendFuture {
+        match &mut self.inner {
+            ProducerInner::Single(p) => p.send_raw(message).await.unwrap(),
+            ProducerInner::Partitioned(_) => panic!("forge on a single-topic producer"),
+        }
+    }
+
     /// this producer's topic
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn topic(&self) -> &str {
