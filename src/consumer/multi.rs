@@ -333,7 +333,7 @@ impl<T: DeserializeMessage, Exe: Executor> Debug for MultiTopicConsumer<T, Exe> 
         write!(
             f,
             "MultiTopicConsumer({:?}, {:?})",
-            &self.namespace, &self.topic_regex
+            self.namespace, self.topic_regex
         )
     }
 }

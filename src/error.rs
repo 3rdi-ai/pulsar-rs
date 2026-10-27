@@ -291,7 +291,6 @@ impl fmt::Display for DecodeRefusal {
 #[derive(Debug)]
 pub enum ConsumerError {
     Connection(ConnectionError),
-    MissingPayload(String),
     Io(io::Error),
     /// The engine refused to decode a message (see [`DecodeRefusal`]) and
     /// SETTLED it: sent it, still compressed, to the dead-letter topic when a
@@ -336,7 +335,6 @@ impl fmt::Display for ConsumerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ConsumerError::Connection(e) => write!(f, "Connection error: {e}"),
-            ConsumerError::MissingPayload(s) => write!(f, "Missing payload: {s}"),
             ConsumerError::Io(s) => write!(f, "Decompression error: {s}"),
             ConsumerError::Refused {
                 reason,

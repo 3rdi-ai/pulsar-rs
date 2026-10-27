@@ -2089,6 +2089,66 @@ mod tests {
         dlq.ack(&parked).await.unwrap();
     }
 
+    /// A refused message whose dead-letter send FAILS is not acknowledged:
+    /// the stream yields the send's own error (not a `Refused`, so a caller
+    /// treats it as the consumer failing, never as a skipped message) and the
+    /// broker redelivers the message to the next consumer on the subscription.
+    #[tokio::test]
+    #[cfg(feature = "zstd")]
+    async fn a_failed_dead_letter_send_leaves_the_refused_message_unacknowledged() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+        let addr = "pulsar://127.0.0.1:6650";
+        let test_id: u32 = rand::random();
+        let topic = format!("over_cap_dlq_fails_{test_id}");
+        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let mut producer = zstd_producer(&client, &topic).await;
+
+        // A tenant that does not exist: the dead-letter producer cannot be created.
+        let policy = DeadLetterPolicy {
+            max_redeliver_count: 3,
+            dead_letter_topic: format!("persistent://no-such-tenant-{test_id}/ns/dlq"),
+        };
+        let mut first = shared_earliest_consumer(&client, &topic, "dlq-fails", Some(policy)).await;
+        publish(&mut producer, vec![0u8; BOMB_DECODED_LEN]).await;
+
+        let failed = timeout(Duration::from_secs(120), first.next())
+            .await
+            .expect("the failed dead-letter send must surface on the stream")
+            .expect("stream open");
+        assert!(failed.is_err(), "expected an error, got a message");
+        assert!(
+            !matches!(
+                failed,
+                Err(Error::Consumer(crate::error::ConsumerError::Refused { .. }))
+            ),
+            "a failed dead-letter send must not read as a settled refusal: {failed:?}"
+        );
+        let _ = first.close().await;
+        drop(first);
+
+        let mut second: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("dlq-fails")
+            .with_subscription_type(SubType::Shared)
+            .with_options(
+                ConsumerOptions {
+                    initial_position: InitialPosition::Earliest,
+                    ..Default::default()
+                }
+                .with_max_decompressed_size(2 * BOMB_DECODED_LEN),
+            )
+            .build()
+            .await
+            .unwrap();
+        let redelivered = recv_within(&mut second, Duration::from_secs(30))
+            .await
+            .expect("the unacknowledged message must be redelivered");
+        assert_eq!(redelivered.payload.data.len(), BOMB_DECODED_LEN);
+        second.ack(&redelivered).await.unwrap();
+    }
+
     /// A consumer that raised `max_decompressed_size` on purpose receives a
     /// message the default cap would refuse.
     #[tokio::test]

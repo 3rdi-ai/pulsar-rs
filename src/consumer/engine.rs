@@ -13,7 +13,6 @@ use futures::{
 use crate::{
     connection::Connection,
     consumer::{
-        batched_message_iterator::BatchedMessageIterator,
         data::{DeadLetterPolicy, EngineEvent, EngineMessage},
         options::ConsumerOptions,
     },
@@ -402,6 +401,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             } => {
                 self.process_payload(message, payload).await?;
             }
+            // The broker never sends a CommandMessage without its payload; a
+            // frame that parsed without one is logged and dropped (nothing is
+            // delivered, so nothing reaches the consumer stream).
             RawMessage {
                 command: BaseCommand {
                     message: Some(_), ..
@@ -446,42 +448,20 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     async fn process_payload(
         &mut self,
         message: CommandMessage,
-        mut payload: Payload,
+        payload: Payload,
     ) -> Result<(), Error> {
-        let compression = match payload.metadata.compression {
-            None => proto::CompressionType::None,
-            Some(compression) => match proto::CompressionType::try_from(compression) {
-                Ok(compression) => compression,
-                Err(err) => {
-                    let reason = DecodeRefusal::Undecodable(format!(
-                        "unknown compression type {compression}: {err}"
-                    ));
+        let limit = self
+            .options
+            .max_decompressed_size
+            .unwrap_or(super::decompress::DEFAULT_MAX_DECOMPRESSED_SIZE);
+        let payloads =
+            match super::decompress::decode_payload(message.message_id.clone(), payload, limit) {
+                Ok(payloads) => payloads,
+                Err(refused) => {
+                    let (payload, reason) = *refused;
                     return Err(self.settle_refused(message, payload, reason).await);
                 }
-            },
-        };
-
-        if compression != proto::CompressionType::None {
-            let limit = self
-                .options
-                .max_decompressed_size
-                .unwrap_or(super::decompress::DEFAULT_MAX_DECOMPRESSED_SIZE);
-            match super::decompress::decompress(
-                compression,
-                &payload.data,
-                payload.metadata.uncompressed_size,
-                limit,
-            ) {
-                Ok(data) => payload.data = data,
-                Err(reason) => return Err(self.settle_refused(message, payload, reason).await),
-            }
-        }
-
-        let payloads = if payload.metadata.num_messages_in_batch.is_some() {
-            BatchedMessageIterator::new(message.message_id, payload)?.collect()
-        } else {
-            vec![(message.message_id, payload)]
-        };
+            };
         for (message_id, payload) in payloads {
             match (message.redelivery_count, self.dead_letter_policy.clone()) {
                 (Some(redelivery_count), Some(dead_letter_policy))
