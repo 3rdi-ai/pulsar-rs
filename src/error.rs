@@ -244,7 +244,9 @@ impl std::error::Error for ConnectionError {
 }
 
 /// Why the consumer engine refused to decode a message. Carries no payload
-/// bytes and no message id, so it is safe to log.
+/// bytes and no message id, so it is safe to log: a parse failure is
+/// rendered as its error kind plus the remaining input LENGTH, never the
+/// input, so the reason stays short whatever the message holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeRefusal {
     /// The message decodes, or declares it decodes, past the consumer's

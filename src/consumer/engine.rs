@@ -223,7 +223,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     debug!("consumer engine: timeout (1s)");
                 }
                 Ok(Some(EngineEvent::Message(msg))) => {
-                    debug!("consumer engine: received message, {:?}", msg);
+                    // The command only: the payload is publisher bytes.
+                    debug!(
+                        "consumer engine: received message, {:?}",
+                        msg.as_ref().map(|m| &m.command)
+                    );
                     let out = self.handle_message_opt(msg).await;
                     if let Some(res) = out {
                         return res;

@@ -16,6 +16,15 @@ use crate::{connection::RequestKey, error::ConnectionError};
 
 const CRC_CASTAGNOLI: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
 
+/// A nom parse error as a decode error naming only what failed and how
+/// many input bytes remained. The error's Debug form prints the whole
+/// remaining input, i.e. publisher bytes, into a string that is logged and
+/// surfaced as a refusal reason.
+fn decoding_error(what: &str, err: nom::Err<nom::error::Error<&[u8]>>) -> ConnectionError {
+    let err = err.map_input(<[u8]>::len);
+    ConnectionError::Decoding(format!("Error decoding {what}: {err:?}"))
+}
+
 /// Pulsar binary message
 ///
 /// this structure holds any command sent to pulsar, like looking up a topic or
@@ -308,20 +317,13 @@ impl tokio_util::codec::Decoder for Codec {
             let src = buf.into_inner();
             if src.len() >= message_size {
                 let msg = {
-                    let (buf, command_frame) =
-                        command_frame(&src[..message_size]).map_err(|err| {
-                            ConnectionError::Decoding(format!(
-                                "Error decoding command frame: {err:?}"
-                            ))
-                        })?;
+                    let (buf, command_frame) = command_frame(&src[..message_size])
+                        .map_err(|err| decoding_error("command frame", err))?;
                     let command = BaseCommand::decode(command_frame.command)?;
 
                     let payload = if !buf.is_empty() {
-                        let (buf, payload_frame) = payload_frame(buf).map_err(|err| {
-                            ConnectionError::Decoding(format!(
-                                "Error decoding payload frame: {err:?}"
-                            ))
-                        })?;
+                        let (buf, payload_frame) = payload_frame(buf)
+                            .map_err(|err| decoding_error("payload frame", err))?;
 
                         let metadata = Metadata::decode(payload_frame.metadata)?;
 
@@ -435,20 +437,13 @@ impl asynchronous_codec::Decoder for Codec {
             let src = buf.into_inner();
             if src.len() >= message_size {
                 let msg = {
-                    let (buf, command_frame) =
-                        command_frame(&src[..message_size]).map_err(|err| {
-                            ConnectionError::Decoding(format!(
-                                "Error decoding command frame: {err:?}"
-                            ))
-                        })?;
+                    let (buf, command_frame) = command_frame(&src[..message_size])
+                        .map_err(|err| decoding_error("command frame", err))?;
                     let command = BaseCommand::decode(command_frame.command)?;
 
                     let payload = if !buf.is_empty() {
-                        let (buf, payload_frame) = payload_frame(buf).map_err(|err| {
-                            ConnectionError::Decoding(format!(
-                                "Error decoding payload frame: {err:?}"
-                            ))
-                        })?;
+                        let (buf, payload_frame) = payload_frame(buf)
+                            .map_err(|err| decoding_error("payload frame", err))?;
 
                         let metadata = Metadata::decode(payload_frame.metadata)?;
 
@@ -579,10 +574,8 @@ pub(crate) fn parse_batched_message(
     count: u32,
     payload: &[u8],
 ) -> Result<Vec<BatchedMessage>, ConnectionError> {
-    let (_, result) =
-        nom::multi::count(batched_message, count as usize)(payload).map_err(|err| {
-            ConnectionError::Decoding(format!("Error decoding batched messages: {err:?}"))
-        })?;
+    let (_, result) = nom::multi::count(batched_message, count as usize)(payload)
+        .map_err(|err| decoding_error("batched messages", err))?;
     Ok(result)
 }
 

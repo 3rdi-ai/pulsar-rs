@@ -535,6 +535,42 @@ mod tests {
         );
     }
 
+    /// The bytes a corrupt member table would leak: a distinctive marker.
+    const MARKER: &[u8] = b"TENANT-SECRET-MARKER";
+
+    /// True when `reason` carries `MARKER` raw or as its decimal rendering
+    /// (how a `&[u8]` Debug prints), or is long enough to carry a body.
+    fn leaks(reason: &str) -> bool {
+        let decimal = format!("{:?}", &MARKER[..4]);
+        let decimal = decimal.trim_matches(|c| c == '[' || c == ']');
+        reason.len() >= 256
+            || reason.contains(std::str::from_utf8(MARKER).unwrap())
+            || reason.contains(decimal)
+    }
+
+    /// One valid member, then a member whose metadata (marker bytes) is not
+    /// a protobuf, so the parser fails WITH the remaining table as its
+    /// input: the refusal names the parse failure, never those bytes.
+    #[test]
+    fn a_corrupt_member_table_refusal_carries_no_payload_bytes() {
+        use crate::message::{proto::SingleMessageMetadata, BatchedMessage};
+        let mut table = Vec::new();
+        BatchedMessage {
+            metadata: SingleMessageMetadata {
+                payload_size: 3,
+                ..Default::default()
+            },
+            payload: b"one".to_vec(),
+        }
+        .serialize(&mut table);
+        table.extend_from_slice(&(MARKER.len() as u32).to_be_bytes());
+        table.extend_from_slice(&MARKER.repeat(64));
+        let payload = batch_payload(table, None, None, 2);
+        let (_, reason) = *decode_payload(Default::default(), payload, LIMIT).unwrap_err();
+        let reason = reason.to_string();
+        assert!(!leaks(&reason), "{} bytes: {reason}", reason.len());
+    }
+
     #[test]
     fn an_uncompressed_batch_with_a_corrupt_member_table_is_refused() {
         let table = vec![0xffu8; 64];
@@ -639,13 +675,18 @@ mod tests {
     proptest::proptest! {
         /// Whatever a publisher puts in the codec, declared size, batch count
         /// and body, decoding never panics, a refusal hands back the bytes
-        /// exactly as received, and success yields at least one payload (an
-        /// empty success would leave the message unsettled).
+        /// exactly as received and names no body bytes, and success yields
+        /// exactly the declared member count (an empty success would leave
+        /// the message unsettled).
         #[test]
         fn decode_payload_never_panics_and_refusals_carry_the_original_bytes(
             codec in proptest::option::of(-2i32..8),
             declared in proptest::option::of(proptest::prelude::any::<u32>()),
-            count in proptest::option::of(-3i32..6),
+            count in proptest::option::of(proptest::prop_oneof![
+                -3i32..6,
+                proptest::prelude::Just(i32::MAX),
+                proptest::prelude::Just(i32::MIN),
+            ]),
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
             let payload = crate::Payload {
@@ -659,8 +700,21 @@ mod tests {
                 data: data.clone(),
             };
             match decode_payload(Default::default(), payload, LIMIT) {
-                Ok(members) => proptest::prop_assert!(!members.is_empty()),
-                Err(refused) => proptest::prop_assert_eq!(&refused.0.data, &data),
+                Ok(members) => proptest::prop_assert_eq!(
+                    members.len(),
+                    count.map_or(1, |c| c as usize)
+                ),
+                Err(refused) => {
+                    let (back, reason) = *refused;
+                    proptest::prop_assert_eq!(&back.data, &data);
+                    let reason = reason.to_string();
+                    proptest::prop_assert!(reason.len() < 256, "{} bytes: {}", reason.len(), reason);
+                    if data.len() >= 8 {
+                        let body = format!("{:?}", &data[..8]);
+                        let body = body.trim_matches(|c| c == '[' || c == ']');
+                        proptest::prop_assert!(!reason.contains(body), "{}", reason);
+                    }
+                }
             }
         }
     }
