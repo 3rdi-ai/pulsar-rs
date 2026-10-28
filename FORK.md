@@ -58,11 +58,13 @@ items.
   broker a fresh permit window (`i32::MIN` no longer stalls the
   subscription). The resubscribe backs off per consumer: 100 ms, doubling,
   capped at 60 s (the Java client's reconnection backoff), and starts over
-  only after more than 120 s without one. A publisher forging entries
-  continuously gets about one resubscribe a minute; the worst case is a
-  burst cycle: forging back to back gets 10 resubscribes in about 102 s
-  (100 ms up to 51.2 s), then 120 s of silence resets the backoff, so about
-  2.7 resubscribes a minute across the cycle. Every resubscribe redelivers
+  only after a quiet period of more than 120 s measured from when the last
+  resubscribe fired (or, if its reconnect was slow, completed). A publisher
+  forging entries continuously gets about one resubscribe a minute; the
+  worst case is a burst cycle: forging back to back gets 10 resubscribes,
+  the last firing about 102.3 s in (100 ms up to 51.2 s), then a forge just
+  over 120 s after that fire restarts at 100 ms: 10 resubscribes per about
+  222 s, about 2.7 a minute across the cycle. Every resubscribe redelivers
   the consumer's whole unacknowledged set. A failed dead-letter send leaves
   the entry unacknowledged and schedules no resubscribe (which would
   redeliver, refuse and resubscribe in a loop); a failed ack schedules none

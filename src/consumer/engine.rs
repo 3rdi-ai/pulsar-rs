@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -96,7 +96,8 @@ struct ForcedResubscribe {
     due: Option<Instant>,
     /// The backoff step of the next one.
     attempt: u32,
-    /// When the last one was scheduled.
+    /// When the last one fired (or, once its reconnect is done, completed):
+    /// the quiet period that resets the backoff runs from here.
     last: Option<Instant>,
 }
 
@@ -104,7 +105,7 @@ impl ForcedResubscribe {
     /// Schedules a resubscribe at `now` plus the backoff and returns that
     /// delay, unless one is already pending (it resets the window for every
     /// entry before it): then nothing changes and this returns `None`. The
-    /// backoff starts over when the last one was scheduled more than
+    /// backoff starts over when the last one fired (or completed) more than
     /// [`FORCED_RESUBSCRIBE_RESET_AFTER`] before `now`.
     fn schedule(&mut self, now: Instant, initial: Duration) -> Option<Duration> {
         if self.due.is_some() {
@@ -117,9 +118,15 @@ impl ForcedResubscribe {
         }
         let delay = forced_resubscribe_backoff(self.attempt, initial);
         self.attempt = self.attempt.saturating_add(1);
-        self.last = Some(now);
+        self.last = Some(now + delay);
         self.due = Some(now + delay);
         Some(delay)
+    }
+
+    /// Records that a resubscribe completed at `now`, so a reconnect slower
+    /// than the quiet period does not reset the backoff by itself.
+    fn completed(&mut self, now: Instant) {
+        self.last = self.last.map(|last| last.max(now));
     }
 }
 
@@ -180,7 +187,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     forced_initial_backoff: Duration,
     /// Test seam: how many coming `reconnect` calls fail before doing anything.
     #[cfg(test)]
-    reconnect_failures: Arc<AtomicU32>,
+    reconnect_failures: Arc<std::sync::atomic::AtomicU32>,
     /// Test seam: after every successful resubscribe, the count of messages
     /// still tracked for unacked redelivery.
     #[cfg(test)]
@@ -239,7 +246,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 FORCED_RESUBSCRIBE_INITIAL_BACKOFF
             },
             #[cfg(test)]
-            reconnect_failures: Arc::new(AtomicU32::new(0)),
+            reconnect_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
             resubscribed_tx,
             #[cfg(test)]
@@ -255,7 +262,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
     /// The reconnect-failure injection counter, shared with the consumer.
     #[cfg(test)]
-    pub(crate) fn reconnect_failures(&self) -> Arc<AtomicU32> {
+    pub(crate) fn reconnect_failures(&self) -> Arc<std::sync::atomic::AtomicU32> {
         Arc::clone(&self.reconnect_failures)
     }
 
@@ -867,14 +874,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         // new one, so their redelivery timers go (Java's clearReceiverQueue).
         self.forced.due = None;
         self.unacked_messages.clear();
-        #[cfg(test)]
-        if self
-            .reconnect_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(Error::Custom("injected reconnect failure".to_string()));
-        }
 
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
@@ -886,6 +885,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             );
         }
         // should have logged "rx terminated" by now
+
+        // A failed lookup or subscribe from here on, injected in tests.
+        #[cfg(test)]
+        if self
+            .reconnect_failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::Custom("injected reconnect failure".to_string()));
+        }
 
         let broker_address = self.client.lookup_topic(&self.topic).await?;
 
@@ -908,6 +917,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .resubscribed_tx
             .unbounded_send(self.unacked_messages.len());
 
+        self.forced.completed(Instant::now());
         self.remaining_messages = self.batch_size as i64;
         self.messages_rx = Some(messages);
 
@@ -1112,14 +1122,29 @@ mod tests {
             delays,
             [100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 60000, 60000]
         );
-        // `now` ran one capped delay past the last scheduling.
-        now = now - FORCED_RESUBSCRIBE_MAX_BACKOFF + Duration::from_secs(119);
-        assert_eq!(
-            resubscribe_at(&mut forced, now),
-            FORCED_RESUBSCRIBE_MAX_BACKOFF
-        );
-        now += Duration::from_secs(121);
+        // `now` is when the last one fired; each later one fires `max` on.
+        let max = FORCED_RESUBSCRIBE_MAX_BACKOFF;
+        now += Duration::from_secs(119);
+        assert_eq!(resubscribe_at(&mut forced, now), max);
+        now += max + Duration::from_secs(120);
+        assert_eq!(resubscribe_at(&mut forced, now), max, "exactly 120 s");
+        now += max + Duration::from_secs(121);
         assert_eq!(resubscribe_at(&mut forced, now), INITIAL);
         assert_eq!(resubscribe_at(&mut forced, now), 2 * INITIAL);
+    }
+
+    /// A reconnect slower than the quiet period keeps the backoff.
+    #[test]
+    fn a_slow_forced_resubscribe_keeps_the_backoff() {
+        let (max, mut now) = (FORCED_RESUBSCRIBE_MAX_BACKOFF, Instant::now());
+        let mut forced = ForcedResubscribe {
+            attempt: 20,
+            ..Default::default()
+        };
+        assert_eq!(resubscribe_at(&mut forced, now), max);
+        now += max + Duration::from_secs(90); // fired, then reconnected 90 s
+        forced.completed(now);
+        now += Duration::from_secs(119);
+        assert_eq!(resubscribe_at(&mut forced, now), max);
     }
 }
