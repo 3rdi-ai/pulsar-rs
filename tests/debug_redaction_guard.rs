@@ -167,26 +167,7 @@ fn derives_debug(attrs: &[syn::Attribute], aliases: &Aliases) -> bool {
             }
         } else if attr.path().is_ident("cfg_attr") {
             let mut found = false;
-            let result = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("derive") {
-                    meta.parse_nested_meta(|d| {
-                        if d.path.segments.last().is_some_and(|s| {
-                            aliases.debug_names.iter().any(|n| s.ident == n.as_str())
-                        }) {
-                            found = true;
-                        }
-                        Ok(())
-                    })
-                } else if meta.input.peek(syn::Token![=]) {
-                    meta.value()?.parse::<syn::Expr>()?;
-                    Ok(())
-                } else if meta.input.peek(syn::token::Paren) {
-                    meta.input.parse::<proc_macro2::Group>()?;
-                    Ok(())
-                } else {
-                    Ok(())
-                }
-            });
+            let result = attr.parse_nested_meta(|meta| cfg_attr_item(meta, aliases, &mut found));
             if result.is_err() {
                 panic!("failed to parse cfg_attr attribute; the guard fails closed");
             }
@@ -196,6 +177,38 @@ fn derives_debug(attrs: &[syn::Attribute], aliases: &Aliases) -> bool {
         }
     }
     false
+}
+
+/// One item of a `cfg_attr(...)` list: a `derive(...)` sets `found` when it
+/// names a Debug derive, a nested `cfg_attr(...)` recurses, and a cfg
+/// predicate (`test`, `feature = "x"`, `all(...)`) is skipped.
+fn cfg_attr_item(
+    meta: syn::meta::ParseNestedMeta<'_>,
+    aliases: &Aliases,
+    found: &mut bool,
+) -> syn::Result<()> {
+    if meta.path.is_ident("derive") {
+        meta.parse_nested_meta(|d| {
+            if d.path
+                .segments
+                .last()
+                .is_some_and(|s| aliases.debug_names.iter().any(|n| s.ident == n.as_str()))
+            {
+                *found = true;
+            }
+            Ok(())
+        })
+    } else if meta.path.is_ident("cfg_attr") {
+        meta.parse_nested_meta(|inner| cfg_attr_item(inner, aliases, found))
+    } else if meta.input.peek(syn::Token![=]) {
+        meta.value()?.parse::<syn::Expr>()?;
+        Ok(())
+    } else if meta.input.peek(syn::token::Paren) {
+        meta.input.parse::<proc_macro2::Group>()?;
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 /// True if the field name contains a secret word or its type references a
@@ -534,6 +547,14 @@ fn classifier_fixtures() {
     );
 
     assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[cfg_attr(feature = \"x\", cfg_attr(test, derive(Debug)))] struct S { token: String }"
+        ),
+        vec!["f.rs::S::token"]
+    );
+
+    assert_eq!(
         flag_source("f.rs", "#[derive(Debug)] struct P(u8, Vec<CachedToken>);"),
         vec!["f.rs::P::1"]
     );
@@ -621,6 +642,15 @@ fn macro_fixtures() {
         Vec::<String>::new()
     );
     assert_eq!(macro_types("f.rs", "m! { enum E { A } }"), vec!["f.rs::m!"]);
+}
+
+#[test]
+#[should_panic(expected = "cfg_attr")]
+fn unparseable_cfg_attr_derive_fails_closed() {
+    flag_source(
+        "f.rs",
+        "#[cfg_attr(test, derive(Debug Clone))] struct A { id: u8 }",
+    );
 }
 
 #[test]
