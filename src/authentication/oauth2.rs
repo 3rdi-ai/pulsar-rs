@@ -21,7 +21,10 @@ use url::Url;
 
 use crate::{authentication::Authentication, error::AuthenticationError};
 
-#[derive(Deserialize, Debug, Clone)]
+/// What a credential reads as in any formatted output.
+const REDACTED: &str = "<redacted>";
+
+#[derive(Deserialize, Clone)]
 struct OAuth2PrivateParams {
     client_id: String,
     client_secret: String,
@@ -30,12 +33,37 @@ struct OAuth2PrivateParams {
     issuer_url: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+/// Names the client, never its secret.
+impl std::fmt::Debug for OAuth2PrivateParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2PrivateParams")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &REDACTED)
+            .field("client_email", &self.client_email)
+            .field("issuer_url", &self.issuer_url)
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct OAuth2Params {
     pub issuer_url: String,
     pub credentials_url: String,
     pub audience: Option<String>,
     pub scope: Option<String>,
+}
+
+/// The credentials URL shows as its scheme only (a `file:` URL keeps its
+/// path): a `data:` URL embeds the client secret.
+impl std::fmt::Debug for OAuth2Params {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2Params")
+            .field("issuer_url", &self.issuer_url)
+            .field("credentials_url", &self.credentials_hint())
+            .field("audience", &self.audience)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl Display for OAuth2Params {
@@ -44,7 +72,10 @@ impl Display for OAuth2Params {
         write!(
             f,
             "OAuth2Params({}, {}, {:?}, {:?})",
-            self.issuer_url, self.credentials_url, self.audience, self.scope
+            self.issuer_url,
+            self.credentials_hint(),
+            self.audience,
+            self.scope
         )
     }
 }
@@ -102,57 +133,63 @@ impl OAuth2Authentication {
             token: None,
         })
     }
+}
 
+impl OAuth2Params {
+    /// The credentials URL with everything but a `file:` path blanked.
     fn credentials_hint(&self) -> String {
-        match Url::parse(self.params.credentials_url.as_str()) {
+        match Url::parse(self.credentials_url.as_str()) {
             Ok(url) => match url.scheme() {
                 "file" => format!("file:{}", url.path()),
-                scheme => format!("{scheme}:<redacted>"),
+                scheme => format!("{scheme}:{REDACTED}"),
             },
             Err(_) => String::from("<invalid credentials_url>"),
         }
     }
-}
 
-impl OAuth2Params {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn read_private_params(&self) -> Result<OAuth2PrivateParams, Box<dyn std::error::Error>> {
         let credentials_url = Url::parse(self.credentials_url.as_str())?;
         match credentials_url.scheme() {
             "file" => {
                 let path = credentials_url.path();
-                Ok(serde_json::from_str(fs::read_to_string(path)?.as_str())?)
+                Ok(serde_json::from_str(fs::read_to_string(path)?.as_str()).map_err(json_error)?)
             }
             "data" => {
                 let data_url = match DataUrl::process(self.credentials_url.as_str()) {
                     Ok(data_url) => data_url,
                     Err(err) => {
-                        return Err(Box::from(format!(
-                            "invalid data url [{}]: {:?}",
-                            self.credentials_url.as_str(),
-                            err
-                        )));
+                        return Err(Box::from(format!("invalid data url: {err:?}")));
                     }
                 };
                 let body = match data_url.decode_to_vec() {
                     Ok((body, _)) => body,
-                    Err(err) => {
-                        return Err(Box::from(format!(
-                            "invalid data url [{}]: {:?}",
-                            self.credentials_url.as_str(),
-                            err
-                        )));
+                    Err(_) => {
+                        return Err(Box::from(
+                            "invalid data url: malformed base64 body".to_string(),
+                        ));
                     }
                 };
 
-                Ok(serde_json::from_slice(&body)?)
+                Ok(serde_json::from_slice(&body).map_err(json_error)?)
             }
             _ => Err(Box::from(format!(
-                "invalid credential url [{}]",
-                self.credentials_url.as_str()
+                "unsupported credentials url scheme [{}]",
+                credentials_url.scheme()
             ))),
         }
     }
+}
+
+/// A credentials JSON error by kind and position only: serde messages can
+/// quote the offending value.
+fn json_error(e: serde_json::Error) -> Box<dyn std::error::Error> {
+    Box::from(format!(
+        "malformed credentials JSON ({:?} error at line {}, column {})",
+        e.classify(),
+        e.line(),
+        e.column()
+    ))
 }
 
 #[async_trait]
@@ -169,7 +206,7 @@ impl Authentication for OAuth2Authentication {
             Err(e) => {
                 return Err(AuthenticationError::Custom(format!(
                     "failed to read OAuth2 credentials from {}: {e}",
-                    self.credentials_hint()
+                    self.params.credentials_hint()
                 )));
             }
         }
@@ -290,8 +327,18 @@ impl OAuth2Authentication {
 
         let client = reqwest::Client::new();
         let token = request.request_async(&client).await.map_err(|e| {
+            let kind = match &e {
+                RequestTokenError::ServerResponse(r) => {
+                    format!("server rejected the request: {}", r.error())
+                }
+                RequestTokenError::Request(e) => format!("request failed: {e}"),
+                RequestTokenError::Parse(_, body) => {
+                    format!("unparseable token response ({} bytes)", body.len())
+                }
+                RequestTokenError::Other(e) => format!("unexpected token response: {e}"),
+            };
             let error_message = format!(
-                "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?}): {e:?}",
+                "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?}): {kind}",
                 self.params.issuer_url, self.params.audience, self.params.scope
             );
             if let RequestTokenError::ServerResponse(_) = e {
@@ -316,6 +363,182 @@ mod tests {
         },
         error::{AuthenticationError, ConnectionError},
     };
+
+    /// A secret no formatted value may ever contain.
+    const SENTINEL: &str = "S3CR3T-SENTINEL";
+
+    /// `data:` URL whose base64 JSON embeds [`SENTINEL`] as the client secret,
+    /// with the base64 payload returned so a test can assert it is absent too.
+    fn sentinel_data_url() -> (String, String) {
+        use base64::Engine;
+        let json = format!(r#"{{"client_id":"cid","client_secret":"{SENTINEL}"}}"#);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+        (format!("data:application/json;base64,{b64}"), b64)
+    }
+
+    fn assert_no_secret(rendered: &str, b64: &str) {
+        assert!(!rendered.contains(SENTINEL), "secret leaked: {rendered}");
+        assert!(!rendered.contains(b64), "base64 secret leaked: {rendered}");
+        // a `Vec<u8>` body renders as its byte list under `{:?}`
+        let bytes = format!("{:?}", SENTINEL.as_bytes());
+        let bytes = bytes.trim_start_matches('[').trim_end_matches(']');
+        assert!(!rendered.contains(bytes), "secret bytes leaked: {rendered}");
+    }
+
+    #[test]
+    fn params_formatting_carries_no_credentials() {
+        let (credentials_url, b64) = sentinel_data_url();
+        let params = OAuth2Params {
+            issuer_url: "https://issuer.example".to_string(),
+            credentials_url,
+            audience: Some("aud".to_string()),
+            scope: None,
+        };
+        for rendered in [
+            format!("{params:?}"),
+            format!("{params:#?}"),
+            format!("{params}"),
+        ] {
+            assert_no_secret(&rendered, &b64);
+            assert!(rendered.contains("https://issuer.example"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn private_params_debug_carries_no_secret() {
+        let p = OAuth2PrivateParams {
+            client_id: "cid".to_string(),
+            client_secret: SENTINEL.to_string(),
+            client_email: None,
+            issuer_url: None,
+        };
+        for rendered in [format!("{p:?}"), format!("{p:#?}")] {
+            assert_no_secret(&rendered, "unused-b64-marker");
+            assert!(rendered.contains("cid"));
+        }
+    }
+
+    #[test]
+    fn basic_authentication_debug_carries_no_password() {
+        use crate::authentication::basic::BasicAuthentication;
+        let auth = BasicAuthentication::new("user", SENTINEL);
+        for rendered in [format!("{auth:?}"), format!("{auth:#?}")] {
+            assert_no_secret(&rendered, "unused-b64-marker");
+        }
+    }
+
+    #[test]
+    fn bad_credentials_url_errors_carry_no_content() {
+        use base64::Engine;
+        let urls = [
+            format!("data:{SENTINEL}"),
+            format!("data:;base64,{SENTINEL}!!!"),
+            "data:application/json;base64,".to_string()
+                + &base64::engine::general_purpose::STANDARD.encode(format!("not json {SENTINEL}")),
+            format!("ftp://{SENTINEL}@host/creds"),
+        ];
+        for url in urls {
+            let params = OAuth2Params {
+                issuer_url: "https://issuer.example".to_string(),
+                credentials_url: url.clone(),
+                audience: None,
+                scope: None,
+            };
+            let result = params.read_private_params();
+            let err = result.expect_err("bad credentials url must fail");
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                assert_no_secret(&rendered, "unused-b64-marker");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_error_carries_no_credentials() {
+        let urls = [
+            format!("data:{SENTINEL}"),
+            format!("data:;base64,{SENTINEL}!!!"),
+        ];
+        for url in urls {
+            let params = OAuth2Params {
+                issuer_url: "https://issuer.example".to_string(),
+                credentials_url: url.clone(),
+                audience: None,
+                scope: None,
+            };
+            let mut auth = OAuth2Authentication::client_credentials(params);
+            let err = auth.initialize().await.expect_err("must fail");
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                assert_no_secret(&rendered, "unused-b64-marker");
+            }
+            let conn_err = ConnectionError::from(err.clone());
+            for rendered in [format!("{conn_err}"), format!("{conn_err:?}")] {
+                assert_no_secret(&rendered, "unused-b64-marker");
+            }
+        }
+    }
+
+    async fn one_shot_http(status_line: &'static str, body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://127.0.0.1:{port}/token")
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_carry_no_secret() {
+        let cases = [
+            ("200 OK", format!(r#"{{"access_token":"{SENTINEL}""#)),
+            (
+                "400 Bad Request",
+                format!(r#"{{"error":"invalid_client","error_description":"{SENTINEL}"}}"#),
+            ),
+        ];
+        for (status_line, body) in cases {
+            let url = one_shot_http(status_line, body).await;
+            let params = OAuth2Params {
+                issuer_url: "http://127.0.0.1:1".to_string(),
+                credentials_url: "data:,".to_string(),
+                audience: None,
+                scope: None,
+            };
+            let private_params = OAuth2PrivateParams {
+                client_id: "cid".to_string(),
+                client_secret: "other".to_string(),
+                client_email: None,
+                issuer_url: None,
+            };
+            let mut auth = OAuth2Authentication {
+                params,
+                private_params: Some(private_params),
+                token_url: Some(TokenUrl::new(url).unwrap()),
+                token: None,
+            };
+            let err = auth
+                .auth_data()
+                .await
+                .expect_err("token endpoint failure must surface");
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                assert_no_secret(&rendered, "unused-b64-marker");
+            }
+        }
+    }
 
     #[test]
     fn parse_data_url() {

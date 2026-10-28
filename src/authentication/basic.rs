@@ -5,9 +5,17 @@ use async_trait::async_trait;
 use crate::{authentication::Authentication, error::AuthenticationError};
 
 /// Basic Authentication used for username and password authentication
-#[derive(Debug)]
 pub struct BasicAuthentication {
     auth_data: String,
+}
+
+/// `auth_data` is `username:password`: it never reaches a formatted value.
+impl std::fmt::Debug for BasicAuthentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuthentication")
+            .field("auth_data", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BasicAuthentication {

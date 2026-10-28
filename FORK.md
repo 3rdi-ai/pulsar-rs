@@ -37,6 +37,18 @@ The cap is `ConsumerOptions::max_decompressed_size` (default
 `DEFAULT_MAX_DECOMPRESSED_SIZE`, 5 MiB), so a topic with large legitimate
 messages can raise it on purpose.
 
+## Unreleased
+
+- **OAuth2 and Basic credentials never reach formatted output**: the
+  `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
+  scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
+  its path), the private OAuth2 params and `BasicAuthentication` print
+  `<redacted>` for the secret, and credentials-read and token-endpoint
+  errors name the failure kind (parse position, http error code, body
+  length), never the URL contents, a response body or an
+  `error_description`. A source-scan test (`tests/debug_redaction_guard.rs`)
+  fails if a type under `src/` that holds a credential derives `Debug`.
+
 ## v6.9.1-3rdi.9
 
 Supersedes `v6.9.1-3rdi.8` (left in place, not deleted). No new public

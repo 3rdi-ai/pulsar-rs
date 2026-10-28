@@ -64,6 +64,7 @@ tokio = { version = "^1.42.0", features = ["macros", "rt-multi-thread"] }
 assert_matches = "1.5.0"
 proptest = "1"
 reqwest = { version = "0.13", features = ["json"] }
+syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
 prost-build = "^0.13.4"
