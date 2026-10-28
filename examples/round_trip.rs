@@ -63,7 +63,7 @@ async fn main() -> Result<(), pulsar::Error> {
                 .await
                 .unwrap();
             counter += 1;
-            if counter % 1000 == 0 {
+            if counter.is_multiple_of(1000) {
                 println!("sent {counter} messages");
             }
         }
@@ -86,10 +86,10 @@ async fn main() -> Result<(), pulsar::Error> {
         consumer.ack(&msg).await?;
         let data = msg.deserialize().unwrap();
         if data.data.as_str() != "data" {
-            panic!("Unexpected payload: {}", &data.data);
+            panic!("Unexpected payload: {}", data.data);
         }
         counter += 1;
-        if counter % 1000 == 0 {
+        if counter.is_multiple_of(1000) {
             println!("received {counter} messages");
         }
     }
