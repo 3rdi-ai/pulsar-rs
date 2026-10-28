@@ -128,6 +128,13 @@ impl ForcedResubscribe {
     fn completed(&mut self, now: Instant) {
         self.last = self.last.map(|last| last.max(now));
     }
+
+    /// Reschedules after a resubscribe that failed at `now`: the failed one
+    /// counts as the last, so a slow failure does not reset the backoff.
+    fn retry(&mut self, now: Instant, initial: Duration) -> Option<Duration> {
+        self.completed(now);
+        self.schedule(now, initial)
+    }
 }
 
 /// Whether an acknowledged entry declaring `num_messages_in_batch` left the
@@ -323,7 +330,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         "{}: forced resubscribe failed: {e}; retrying",
                         self.debug_format()
                     );
-                    self.schedule_forced_resubscribe();
+                    self.schedule_forced_resubscribe(true);
                 }
             }
 
@@ -815,7 +822,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         if self.ack(message_id, false).await
             && forged_count_corrupts_window(self.sub_type, declared_count)
         {
-            self.schedule_forced_resubscribe();
+            self.schedule_forced_resubscribe(false);
         }
         Error::Consumer(ConsumerError::Refused {
             reason,
@@ -847,11 +854,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// already pending (it resets the window for every entry before it).
     /// The ack goes out before the resubscribe's `CloseConsumer` on the same
     /// connection, so the broker settles the entry before the new session.
-    fn schedule_forced_resubscribe(&mut self) {
-        let Some(delay) = self
-            .forced
-            .schedule(Instant::now(), self.forced_initial_backoff)
-        else {
+    /// `after_failure` reschedules a forced resubscribe that just failed.
+    fn schedule_forced_resubscribe(&mut self, after_failure: bool) {
+        let (now, initial) = (Instant::now(), self.forced_initial_backoff);
+        let scheduled = if after_failure {
+            self.forced.retry(now, initial)
+        } else {
+            self.forced.schedule(now, initial)
+        };
+        let Some(delay) = scheduled else {
             return;
         };
         let scheduled = self.forced_resubscribes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1146,5 +1157,18 @@ mod tests {
         forced.completed(now);
         now += Duration::from_secs(119);
         assert_eq!(resubscribe_at(&mut forced, now), max);
+    }
+
+    /// One slower than the quiet period that then fails keeps it too.
+    #[test]
+    fn a_slow_failed_forced_resubscribe_keeps_the_backoff() {
+        let (max, mut now) = (FORCED_RESUBSCRIBE_MAX_BACKOFF, Instant::now());
+        let mut forced = ForcedResubscribe {
+            attempt: 20,
+            ..Default::default()
+        };
+        assert_eq!(resubscribe_at(&mut forced, now), max);
+        now += max + Duration::from_secs(121); // fired, failed 121 s later
+        assert_eq!(forced.retry(now, INITIAL), Some(max));
     }
 }

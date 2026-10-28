@@ -59,12 +59,14 @@ items.
   subscription). The resubscribe backs off per consumer: 100 ms, doubling,
   capped at 60 s (the Java client's reconnection backoff), and starts over
   only after a quiet period of more than 120 s measured from when the last
-  resubscribe fired (or, if its reconnect was slow, completed). A publisher
-  forging entries continuously gets about one resubscribe a minute; the
-  worst case is a burst cycle: forging back to back gets 10 resubscribes,
-  the last firing about 102.3 s in (100 ms up to 51.2 s), then a forge just
-  over 120 s after that fire restarts at 100 ms: 10 resubscribes per about
-  222 s, about 2.7 a minute across the cycle. Every resubscribe redelivers
+  resubscribe fired (or, if its reconnect was slow, completed or failed).
+  A publisher forging entries continuously rides the cap: about one
+  resubscribe a minute. The worst case is a burst cycle: k resubscribes
+  back to back fire over 0.1 * (2^k - 1) s, then just over 120 s of quiet
+  restarts the backoff, so the cycle repeats every 0.1 * (2^k - 1) + 120 s.
+  That peaks at k = 8 (100 ms up to 12.8 s, 25.5 s of firing): at most
+  about 3.3 resubscribes a minute (k = 7: 3.17, k = 9: 3.16, k = 10:
+  2.70). Every resubscribe redelivers
   the consumer's whole unacknowledged set. A failed dead-letter send leaves
   the entry unacknowledged and schedules no resubscribe (which would
   redeliver, refuse and resubscribe in a loop); a failed ack schedules none
