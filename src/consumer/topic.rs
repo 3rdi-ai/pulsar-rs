@@ -45,6 +45,12 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     /// How many forced resubscribes the engine has scheduled.
     #[cfg(test)]
     pub(crate) forced_resubscribes: Arc<AtomicU64>,
+    /// How many coming engine reconnects fail (injected).
+    #[cfg(test)]
+    pub(crate) reconnect_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// One item per successful resubscribe: the unacked-tracking count then.
+    #[cfg(test)]
+    pub(crate) resubscribed: Option<mpsc::UnboundedReceiver<usize>>,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
@@ -138,6 +144,10 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         );
         #[cfg(test)]
         let forced_resubscribes = c.forced_resubscribes();
+        #[cfg(test)]
+        let reconnect_failures = c.reconnect_failures();
+        #[cfg(test)]
+        let resubscribed = c.take_resubscribed();
         let engine_task = client.executor.spawn(Box::pin(async move {
             c.engine()
                 .map(|res| {
@@ -161,6 +171,10 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             messages_received: 0,
             #[cfg(test)]
             forced_resubscribes,
+            #[cfg(test)]
+            reconnect_failures,
+            #[cfg(test)]
+            resubscribed,
         })
     }
 

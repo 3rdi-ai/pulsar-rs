@@ -1929,7 +1929,13 @@ mod tests {
     /// the consumer's permits, so the client must book the same debit and
     /// grant it back, or the broker stops dispatching. Every ordinary
     /// message published after the hostile entry must still arrive.
-    async fn ordinary_messages_flow_after_a_declared_count(count: i32, sub_type: SubType) {
+    /// `reconnect_failures` forced resubscribes fail first (injected); each
+    /// is retried with the backoff, never the end of the engine.
+    async fn ordinary_messages_flow_after_a_declared_count(
+        count: i32,
+        sub_type: SubType,
+        reconnect_failures: u32,
+    ) {
         const BATCH: u32 = 10;
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
@@ -1951,7 +1957,13 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let before = crate::test_utils::consumer_stats_when(&topic, "declared", |_| true).await;
+        let corrupts = count <= 0 && matches!(sub_type, SubType::Exclusive | SubType::Failover);
+        match &consumer.inner {
+            InnerConsumer::Single(c) => c
+                .reconnect_failures
+                .store(reconnect_failures, std::sync::atomic::Ordering::SeqCst),
+            _ => panic!("one topic builds a single consumer"),
+        }
 
         let mut table = Vec::new();
         crate::message::BatchedMessage {
@@ -1983,11 +1995,8 @@ mod tests {
         // A forced resubscribe redelivers whatever is unacknowledged at that
         // moment (at-least-once, as any reconnect); wait for it, so the
         // ordinary messages below arrive exactly once and in order.
-        if count <= 0 && sub_type != SubType::Shared {
-            crate::test_utils::consumer_stats_when(&topic, "declared", |c| {
-                c["connectedSince"] != before["connectedSince"]
-            })
-            .await;
+        if corrupts {
+            resubscribed(&mut consumer).await;
         }
 
         for i in 0..2 * BATCH {
@@ -2005,10 +2014,15 @@ mod tests {
             assert_eq!(message.payload.data, format!("m{i}").into_bytes());
             consumer.ack(&message).await.unwrap();
         }
-        // A single-active-consumer subscription is resubscribed once to
-        // reset the broker's window a non-positive count corrupted; Shared
-        // never is (the broker skips the entry).
-        let expected = u64::from(count <= 0 && sub_type != SubType::Shared);
+        // A single-active-consumer subscription is resubscribed once (plus
+        // once per injected failure) to reset the broker's window a
+        // non-positive count corrupted; Shared never is (the broker skips
+        // the entry).
+        let expected = if corrupts {
+            1 + u64::from(reconnect_failures)
+        } else {
+            0
+        };
         assert_eq!(
             forced_resubscribes(&consumer),
             expected,
@@ -2018,12 +2032,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_declaring_i32_max_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(i32::MAX, SubType::Shared).await;
+        ordinary_messages_flow_after_a_declared_count(i32::MAX, SubType::Shared, 0).await;
     }
 
     #[tokio::test]
     async fn a_batch_declaring_70000_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(70_000, SubType::Shared).await;
+        ordinary_messages_flow_after_a_declared_count(70_000, SubType::Shared, 0).await;
     }
 
     /// A negative count is refused and acknowledged, and on an Exclusive
@@ -2032,7 +2046,77 @@ mod tests {
     /// resubscribes once to reset the window it drifted.
     #[tokio::test]
     async fn a_batch_declaring_minus_one_members_does_not_stall_dispatch() {
-        ordinary_messages_flow_after_a_declared_count(-1, SubType::Exclusive).await;
+        ordinary_messages_flow_after_a_declared_count(-1, SubType::Exclusive, 0).await;
+    }
+
+    /// Waits for the consumer's engine to complete its next resubscribe and
+    /// returns how many messages it still tracked for unacked redelivery.
+    async fn resubscribed<T: DeserializeMessage>(
+        consumer: &mut Consumer<T, TokioExecutor>,
+    ) -> usize {
+        let notifications = match &mut consumer.inner {
+            InnerConsumer::Single(c) => c.resubscribed.as_mut().expect("the seam is wired"),
+            _ => panic!("one topic builds a single consumer"),
+        };
+        timeout(DEFAULT_RECV_TIMEOUT, notifications.next())
+            .await
+            .expect("the engine must resubscribe")
+            .expect("the engine is running")
+    }
+
+    /// A forced resubscribe that fails is retried with the backoff: two
+    /// injected failures, then the subscription recovers.
+    #[tokio::test]
+    async fn a_failed_forced_resubscribe_is_retried() {
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive, 2).await;
+    }
+
+    /// Key_Shared behaves as Shared against a 5.0.0 broker: an entry
+    /// declaring a non-positive count is never delivered, and nor is an
+    /// ordinary message published after it (the dispatcher stalls). The
+    /// client never sees the entry, so it cannot recover the subscription
+    /// and schedules no resubscribe; the publisher trust boundary is the
+    /// defence (FORK.md). A broker that starts delivering it fails this
+    /// test, which is the cue to include Key_Shared in the recovery.
+    #[tokio::test]
+    async fn a_non_positive_count_on_key_shared_is_never_delivered() {
+        let topic = format!("key_shared_declared_{}", rand::random::<u32>());
+        let client = crate::test_utils::new_pulsar().await;
+        let mut producer = client.producer().with_topic(&topic).build().await.unwrap();
+        let mut consumer: Consumer<Vec<u8>, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("key-shared")
+            .with_subscription_type(SubType::KeyShared)
+            .with_options(ConsumerOptions {
+                initial_position: InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        producer
+            .send_forged(producer::ProducerMessage {
+                payload: b"one".to_vec(),
+                num_messages_in_batch: Some(i32::MIN),
+                ..Default::default()
+            })
+            .await
+            .await
+            .unwrap();
+        producer
+            .send_non_blocking(b"m0".to_vec())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let next = timeout(DEFAULT_RECV_TIMEOUT, consumer.next()).await;
+        assert!(
+            next.is_err(),
+            "Key_Shared delivered after a non-positive count: {:?}",
+            next.map(|o| o.map(|r| r.map(|m| m.payload.data.clone())))
+        );
+        assert_eq!(forced_resubscribes(&consumer), 0);
     }
 
     /// How many forced resubscribes a single-topic consumer's engine scheduled.
@@ -2051,12 +2135,12 @@ mod tests {
     /// messages flow again.
     #[tokio::test]
     async fn a_batch_declaring_i32_min_members_recovers_an_exclusive_subscription() {
-        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive).await;
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive, 0).await;
     }
 
     #[tokio::test]
     async fn a_batch_declaring_i32_min_members_recovers_a_failover_subscription() {
-        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Failover).await;
+        ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Failover, 0).await;
     }
 
     /// A connection error mid-window: the old session's messages still in
@@ -2082,6 +2166,8 @@ mod tests {
             .with_subscription_type(SubType::Exclusive)
             .with_batch_size(BATCH)
             .with_options(ConsumerOptions::default().with_receiver_queue_size(1))
+            // Tracks every delivered message; no timer fires in the test.
+            .with_unacked_message_resend_delay(Some(Duration::from_secs(3600)))
             .build()
             .await
             .unwrap();
@@ -2089,7 +2175,6 @@ mod tests {
             InnerConsumer::Single(c) => c.connection().await.unwrap(),
             _ => panic!("one topic builds a single consumer"),
         };
-        let before = crate::test_utils::consumer_stats_when(&topic, "generation", |_| true).await;
 
         for i in 0..BATCH {
             producer
@@ -2112,10 +2197,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(early.payload.data, b"m0".to_vec());
-        crate::test_utils::consumer_stats_when(&topic, "generation", |c| {
-            c["connectedSince"] != before["connectedSince"]
-        })
-        .await;
+        assert_eq!(
+            resubscribed(&mut consumer).await,
+            0,
+            "the old session's redelivery timers are cleared"
+        );
 
         producer
             .send_non_blocking(b"end".to_vec())

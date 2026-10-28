@@ -58,18 +58,38 @@ items.
   broker a fresh permit window (`i32::MIN` no longer stalls the
   subscription). The resubscribe backs off per consumer: 100 ms, doubling,
   capped at 60 s (the Java client's reconnection backoff), and starts over
-  only after 120 s without one, so a publisher forging entries gets at most
-  about one resubscribe a minute. A failed dead-letter send leaves the entry
-  unacknowledged and schedules no resubscribe (which would redeliver, refuse
-  and resubscribe in a loop); a failed ack schedules none either. The ack
-  and the resubscribe's `CloseConsumer` go out in that order on the same
-  connection. Like any reconnect, the resubscribe redelivers what is
-  unacknowledged at that moment, including messages whose ack the engine
-  had not sent yet (at-least-once). **Shared** is unchanged: the broker skips such an entry, which
-  no client-side change can repair (the producer-trust statement under .8
+  only after more than 120 s without one. A publisher forging entries
+  continuously gets about one resubscribe a minute; the worst case is a
+  burst cycle: forging back to back gets 10 resubscribes in about 102 s
+  (100 ms up to 51.2 s), then 120 s of silence resets the backoff, so about
+  2.7 resubscribes a minute across the cycle. Every resubscribe redelivers
+  the consumer's whole unacknowledged set. A failed dead-letter send leaves
+  the entry unacknowledged and schedules no resubscribe (which would
+  redeliver, refuse and resubscribe in a loop); a failed ack schedules none
+  either. A forced resubscribe that itself fails is retried on the backoff
+  instead of ending the consumer. Any resubscribe (a connection error too)
+  cancels a pending forced one and clears the unacked-redelivery timers of
+  the old session (as `clearReceiverQueue`). The ack and the resubscribe's
+  `CloseConsumer` go out in that order on the same connection. Like any
+  reconnect, the resubscribe redelivers what is unacknowledged at that
+  moment, including messages whose ack the engine had not sent yet
+  (at-least-once). **Shared and Key_Shared** are unchanged: against a 5.0.0
+  standalone broker, an entry declaring `-1` or `i32::MIN` on Key_Shared is
+  never delivered and nor is any ordinary message after it (measured: 0 of
+  20 arrived), the same as Shared. The client never sees the entry, so no
+  client-side change can repair it (the producer-trust statement under .8
   stands).
 - **Receive queue**: each item is measured once, on send, and the receiver
   releases exactly that (the measure travels with the item).
+- **Redaction**: an `UnexpectedResponse` / `Unexpected` connection error, the
+  "unexpected message" warning and the engine's per-message debug line print
+  the command through the same redaction as `Message`'s `Debug`, so a
+  broker's `AuthChallenge` data never reaches an error string or a log.
+- **Planned follow-ups**: send the acks still queued in the engine before a
+  forced resubscribe's close (fewer redeliveries); move the test suite's
+  `Pulsar::builder` constructors onto `test_utils::new_pulsar` (one fixture
+  constructor); a source-scan guard on log content, if a raw-command log
+  recurs.
 
 ## v6.9.1-3rdi.8
 

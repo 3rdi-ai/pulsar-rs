@@ -50,7 +50,7 @@ impl std::fmt::Debug for Message {
 }
 
 /// `command` with its credentials replaced by [`REDACTED`].
-fn redacted(command: &BaseCommand) -> BaseCommand {
+pub(crate) fn redacted(command: &BaseCommand) -> BaseCommand {
     let mut command = command.clone();
     if let Some(connect) = command.connect.as_mut() {
         connect.auth_data = connect.auth_data.as_ref().map(|_| REDACTED.to_vec());
@@ -707,6 +707,37 @@ mod tests {
             Codec, Message, Metadata, Payload,
         },
     };
+
+    /// A response the caller did not expect becomes an
+    /// `UnexpectedResponse` error string, which callers log: a broker's
+    /// AuthChallenge in it must not carry its auth_data bytes.
+    #[test]
+    fn an_unexpected_response_error_carries_no_credentials() {
+        use crate::message::proto::{AuthData, CommandAuthChallenge};
+        const MARKER: &[u8] = b"SECRET-MARKER-7f3a";
+        let message = Message {
+            command: BaseCommand {
+                auth_challenge: Some(CommandAuthChallenge {
+                    challenge: Some(AuthData {
+                        auth_data: Some(MARKER.to_vec()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payload: None,
+        };
+        let error = crate::connection::extract_message(message, |m| m.command.success)
+            .expect_err("no success in an auth challenge");
+        let shown = format!("{error:?} {error}");
+        assert!(shown.contains("auth_challenge"), "{shown}");
+        assert!(
+            !shown.contains(&format!("{MARKER:?}")[1..20]),
+            "the challenge bytes leak: {shown}"
+        );
+        assert!(!shown.contains("SECRET-MARKER"), "{shown}");
+    }
 
     /// Trace logs `{:?}` whole messages: the Debug form must carry neither
     /// a payload's bytes or properties nor any credential the command holds.

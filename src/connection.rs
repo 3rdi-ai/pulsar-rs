@@ -297,7 +297,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             None => {
                                 warn!(
                                     "Received unexpected message; dropping. Message {:?}",
-                                    msg.command
+                                    crate::message::redacted(&msg.command)
                                 )
                             }
                         },
@@ -1325,7 +1325,7 @@ impl<Exe: Executor> Connection<Exe> {
                 let Some(c) = msg.command.connected else {
                     return Err(ConnectionError::Unexpected(format!(
                         "Unexpected message from pulsar: {:?}",
-                        msg.command
+                        crate::message::redacted(&msg.command)
                     )));
                 };
 
@@ -1490,7 +1490,10 @@ impl<Exe: Executor> Drop for Connection<Exe> {
 }
 
 #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-fn extract_message<T: Debug, F>(message: Message, extract: F) -> Result<T, ConnectionError>
+pub(crate) fn extract_message<T: Debug, F>(
+    message: Message,
+    extract: F,
+) -> Result<T, ConnectionError>
 where
     F: FnOnce(Message) -> Option<T>,
 {
@@ -1505,7 +1508,10 @@ where
             trace!("extracted message: {:?}", extracted);
             Ok(extracted)
         } else {
-            Err(ConnectionError::UnexpectedResponse(format!("{cmd:?}")))
+            Err(ConnectionError::UnexpectedResponse(format!(
+                "{:?}",
+                crate::message::redacted(&cmd)
+            )))
         }
     }
 }
