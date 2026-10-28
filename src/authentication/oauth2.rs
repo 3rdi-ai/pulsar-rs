@@ -41,7 +41,7 @@ impl std::fmt::Debug for OAuth2PrivateParams {
             .field("client_id", &self.client_id)
             .field("client_secret", &REDACTED)
             .field("client_email", &self.client_email)
-            .field("issuer_url", &self.issuer_url)
+            .field("issuer_url", &self.issuer_url.as_deref().map(issuer_hint))
             .finish()
     }
 }
@@ -148,19 +148,9 @@ impl OAuth2Params {
         }
     }
 
-    /// The issuer URL as scheme, host, port and path: a query, fragment or
-    /// userinfo can carry a secret.
+    /// [`issuer_hint`] of this issuer URL.
     fn issuer_hint(&self) -> String {
-        match Url::parse(self.issuer_url.as_str()) {
-            Ok(url) => {
-                let host = url.host_str().unwrap_or_default();
-                match url.port() {
-                    Some(port) => format!("{}://{host}:{port}{}", url.scheme(), url.path()),
-                    None => format!("{}://{host}{}", url.scheme(), url.path()),
-                }
-            }
-            Err(_) => String::from("<invalid issuer_url>"),
-        }
+        issuer_hint(&self.issuer_url)
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -194,6 +184,21 @@ impl OAuth2Params {
                 credentials_url.scheme()
             ))),
         }
+    }
+}
+
+/// The issuer URL as scheme, host, port and path: a query, fragment or
+/// userinfo can carry a secret.
+fn issuer_hint(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default();
+            match url.port() {
+                Some(port) => format!("{}://{host}:{port}{}", url.scheme(), url.path()),
+                None => format!("{}://{host}{}", url.scheme(), url.path()),
+            }
+        }
+        Err(_) => String::from("<invalid issuer_url>"),
     }
 }
 
@@ -565,11 +570,13 @@ mod tests {
             client_id: "cid".to_string(),
             client_secret: SENTINEL.to_string(),
             client_email: None,
-            issuer_url: None,
+            // the credentials file's issuer is the one fetch_token uses
+            issuer_url: Some(format!("https://u:{SENTINEL}@h/?s={SENTINEL}#{SENTINEL}")),
         };
         for rendered in [format!("{p:?}"), format!("{p:#?}")] {
             assert_no_secret(&rendered, "unused-b64-marker");
             assert!(rendered.contains("cid"));
+            assert!(rendered.contains("https://h/"), "{rendered}");
         }
     }
 
