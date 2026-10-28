@@ -15,7 +15,9 @@
 //! (a) a hand-written `impl Debug` that prints a secret is not inspected (review covers it; the behavioural tests in src/authentication/oauth2.rs cover the known types),
 //! (b) a generic field `T` instantiated with a secret type is not resolved,
 //! (c) types defined inside macro bodies are invisible, which `no_macro_in_src_defines_a_type` keeps fail-closed; (d) `use … as` and `type` aliases resolve only
-//! from a file's top-level items, within that file.
+//! from a file's top-level items, within that file,
+//! (e) aliases declared in another file are not resolved, and
+//! (f) a field whose type is an innocently named alias (e.g. `type T = String`) inside a type whose name and field names carry no secret word is not flagged.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -54,26 +56,26 @@ const SECRET_TYPES: &[&str] = &[
 /// secret-bearing whatever its fields are called.
 const SECRET_TYPE_NAME_WORDS: &[&str] = &["auth", "token", "credential", "secret"];
 
-/// Exemptions as `(type key, reason)`. The key is
-/// `"<path relative to crate root with forward slashes>::<TypeName>"`.
-/// A stale entry (no longer flagged) fails the test.
+/// Exemptions as `(trigger key, reason)`. An entry covers ONE trigger (a field, a variant, or the type's own name);
+/// a new trigger in an exempt type fails, and a stale entry fails.
+/// The key is `"<path relative to crate root with forward slashes>::<TypeName>[::<Trigger>]"`.
 const EXEMPT: &[(&str, &str)] = &[
     (
-        "src/connection.rs::RequestKey",
-        "`AuthChallenge` is a unit variant: a request-routing tag that carries no data",
+        "src/connection.rs::RequestKey::AuthChallenge",
+        "a unit variant: a request-routing tag that carries no data",
     ),
     (
         "src/error.rs::AuthenticationError",
-        "holds only error message strings, built kind-only at their source \
+        "flagged by its name; holds only error message strings, built kind-only at their source \
          (src/authentication/oauth2.rs tests assert no secret reaches them)",
     ),
     (
-        "src/error.rs::ConnectionError",
-        "flagged for its `Authentication(AuthenticationError)` variant: see that entry",
+        "src/error.rs::ConnectionError::Authentication",
+        "wraps AuthenticationError: see that entry",
     ),
     (
-        "src/error.rs::Error",
-        "flagged for its `Authentication(AuthenticationError)` variant: see that entry",
+        "src/error.rs::Error::Authentication",
+        "wraps AuthenticationError: see that entry",
     ),
 ];
 
@@ -164,20 +166,32 @@ fn derives_debug(attrs: &[syn::Attribute], aliases: &Aliases) -> bool {
                 return true;
             }
         } else if attr.path().is_ident("cfg_attr") {
-            let s = match &attr.meta {
-                syn::Meta::List(l) => l.tokens.to_string(),
-                _ => String::new(),
-            };
-            let compact = s.replace(' ', "");
-            if compact.contains("derive(") {
-                if let Some(idx) = compact.find("derive(") {
-                    let after = &compact[idx + "derive(".len()..];
-                    for name in &aliases.debug_names {
-                        if after.contains(name.as_str()) {
-                            return true;
+            let mut found = false;
+            let result = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("derive") {
+                    meta.parse_nested_meta(|d| {
+                        if d.path.segments.last().is_some_and(|s| {
+                            aliases.debug_names.iter().any(|n| s.ident == n.as_str())
+                        }) {
+                            found = true;
                         }
-                    }
+                        Ok(())
+                    })
+                } else if meta.input.peek(syn::Token![=]) {
+                    meta.value()?.parse::<syn::Expr>()?;
+                    Ok(())
+                } else if meta.input.peek(syn::token::Paren) {
+                    meta.input.parse::<proc_macro2::Group>()?;
+                    Ok(())
+                } else {
+                    Ok(())
                 }
+            });
+            if result.is_err() {
+                panic!("failed to parse cfg_attr attribute; the guard fails closed");
+            }
+            if found {
+                return true;
             }
         }
     }
@@ -238,26 +252,40 @@ struct Scan {
 
 impl<'ast> Visit<'ast> for Scan {
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        if derives_debug(&i.attrs, &self.aliases)
-            && (fields_secret(&i.fields, &self.aliases) || ident_is_secret(&i.ident))
-        {
-            self.flagged.push(format!("{}::{}", self.file, i.ident));
+        if derives_debug(&i.attrs, &self.aliases) {
+            if ident_is_secret(&i.ident) {
+                self.flagged.push(format!("{}::{}", self.file, i.ident));
+            }
+            for (idx, f) in i.fields.iter().enumerate() {
+                if field_is_secret(f, &self.aliases) {
+                    let name = f
+                        .ident
+                        .as_ref()
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| idx.to_string());
+                    self.flagged
+                        .push(format!("{}::{}::{}", self.file, i.ident, name));
+                }
+            }
         }
         syn::visit::visit_item_struct(self, i);
     }
 
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        let ident_secret = ident_is_secret(&i.ident);
-        let variant_secret = i.variants.iter().any(|v| {
-            fields_secret(&v.fields, &self.aliases) || {
-                let v_name = v.ident.to_string().to_lowercase();
-                SECRET_TYPE_NAME_WORDS.iter().any(|w| v_name.contains(w))
-                    || SECRET_FIELD_WORDS.iter().any(|w| v_name.contains(w))
+        if derives_debug(&i.attrs, &self.aliases) {
+            if ident_is_secret(&i.ident) {
+                self.flagged.push(format!("{}::{}", self.file, i.ident));
             }
-        });
-
-        if derives_debug(&i.attrs, &self.aliases) && (ident_secret || variant_secret) {
-            self.flagged.push(format!("{}::{}", self.file, i.ident));
+            for v in &i.variants {
+                let v_name = v.ident.to_string().to_lowercase();
+                let is_secret = fields_secret(&v.fields, &self.aliases)
+                    || SECRET_TYPE_NAME_WORDS.iter().any(|w| v_name.contains(w))
+                    || SECRET_FIELD_WORDS.iter().any(|w| v_name.contains(w));
+                if is_secret {
+                    self.flagged
+                        .push(format!("{}::{}::{}", self.file, i.ident, v.ident));
+                }
+            }
         }
         syn::visit::visit_item_enum(self, i);
     }
@@ -334,16 +362,8 @@ fn no_credential_type_derives_debug() {
     }
     flagged.sort();
 
-    let exempt_keys: Vec<&str> = EXEMPT.iter().map(|(k, _)| *k).collect();
-    let unexempt: Vec<&String> = flagged
-        .iter()
-        .filter(|f| !exempt_keys.contains(&f.as_str()))
-        .collect();
-    let stale: Vec<&str> = exempt_keys
-        .iter()
-        .filter(|k| !flagged.iter().any(|f| f == *k))
-        .copied()
-        .collect();
+    let exempt: Vec<(&str, &str)> = EXEMPT.iter().map(|(k, r)| (*k, *r)).collect();
+    let (unexempt, stale) = partition(&flagged, &exempt);
 
     assert!(
         unexempt.is_empty(),
@@ -358,6 +378,24 @@ fn no_credential_type_derives_debug() {
     }
 }
 
+fn partition<'a>(
+    flagged: &'a [String],
+    exempt: &[(&'a str, &str)],
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let exempt_keys: Vec<&str> = exempt.iter().map(|(k, _)| *k).collect();
+    let unexempt: Vec<&'a str> = flagged
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|f| !exempt_keys.contains(f))
+        .collect();
+    let stale: Vec<&'a str> = exempt_keys
+        .iter()
+        .filter(|k| !flagged.iter().any(|f| f == *k))
+        .copied()
+        .collect();
+    (unexempt, stale)
+}
+
 #[test]
 fn classifier_fixtures() {
     assert_eq!(
@@ -365,7 +403,7 @@ fn classifier_fixtures() {
             "f.rs",
             "#[derive(Debug, Clone)] struct A { password: String }"
         ),
-        vec!["f.rs::A"]
+        vec!["f.rs::A::password"]
     );
 
     assert_eq!(
@@ -381,7 +419,7 @@ fn classifier_fixtures() {
             "f.rs",
             "#[cfg_attr(test, derive(Debug))] struct A { client_secret: String }"
         ),
-        vec!["f.rs::A"]
+        vec!["f.rs::A::client_secret"]
     );
 
     assert_eq!(
@@ -397,7 +435,7 @@ fn classifier_fixtures() {
             "f.rs",
             "#[derive(Debug)] enum E { Sent(proto::BaseCommand) }"
         ),
-        vec!["f.rs::E"]
+        vec!["f.rs::E::Sent"]
     );
 
     assert_eq!(
@@ -405,7 +443,7 @@ fn classifier_fixtures() {
             "f.rs",
             "mod m { #[derive(std::fmt::Debug)] pub struct Inner { auth_data: Vec<u8> } }"
         ),
-        vec!["f.rs::Inner"]
+        vec!["f.rs::Inner::auth_data"]
     );
 
     assert_eq!(
@@ -431,7 +469,7 @@ fn classifier_fixtures() {
 
     assert_eq!(
         flag_source("f.rs", "#[derive(Debug)] enum Cred { Jwt(String) }"),
-        vec!["f.rs::Cred"]
+        vec!["f.rs::Cred::Jwt"]
     );
 
     assert_eq!(
@@ -439,7 +477,7 @@ fn classifier_fixtures() {
             "f.rs",
             "use std::fmt::Debug as D; #[derive(D)] struct S { password: String }"
         ),
-        vec!["f.rs::S"]
+        vec!["f.rs::S::password"]
     );
 
     assert_eq!(
@@ -447,7 +485,7 @@ fn classifier_fixtures() {
             "f.rs",
             "use crate::connection::Authentication as A; #[derive(Debug)] struct W { a: A }"
         ),
-        vec!["f.rs::W"]
+        vec!["f.rs::W::a"]
     );
 
     assert_eq!(
@@ -455,7 +493,7 @@ fn classifier_fixtures() {
             "f.rs",
             "type Raw = proto::CommandConnect; #[derive(Debug)] struct W { c: Raw }"
         ),
-        vec!["f.rs::W"]
+        vec!["f.rs::W::c"]
     );
 
     assert_eq!(
@@ -463,7 +501,7 @@ fn classifier_fixtures() {
             "f.rs",
             "#[derive(Debug)] struct S { bearer: String, api_key: String }"
         ),
-        vec!["f.rs::S"]
+        vec!["f.rs::S::bearer", "f.rs::S::api_key"]
     );
 
     assert_eq!(
@@ -476,8 +514,46 @@ fn classifier_fixtures() {
             "f.rs",
             "#[derive(Debug)] struct W { c: Option<Box<CachedToken>> }"
         ),
-        vec!["f.rs::W"]
+        vec!["f.rs::W::c"]
     );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[cfg_attr(all(test, feature = \"x\"), derive(Clone, Debug))] struct A { token: u8 }"
+        ),
+        vec!["f.rs::A::token"]
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[cfg_attr(test, derive(Clone))] struct A { token: u8 }"
+        ),
+        Vec::<String>::new()
+    );
+
+    assert_eq!(
+        flag_source("f.rs", "#[derive(Debug)] struct P(u8, Vec<CachedToken>);"),
+        vec!["f.rs::P::1"]
+    );
+}
+
+#[test]
+fn an_exempt_type_with_a_new_trigger_still_fails() {
+    let flagged = flag_source(
+        "f.rs",
+        "#[derive(Debug)] enum RequestKey { AuthChallenge, Token(Vec<u8>) }",
+    );
+    assert_eq!(
+        flagged,
+        vec!["f.rs::RequestKey::AuthChallenge", "f.rs::RequestKey::Token"]
+    );
+    let (unexempt, stale) = partition(&flagged, &[("f.rs::RequestKey::AuthChallenge", "unit tag")]);
+    assert_eq!(unexempt, vec!["f.rs::RequestKey::Token"]);
+    assert!(stale.is_empty());
+    let (_, stale) = partition(&flagged, &[("f.rs::RequestKey::Gone", "stale")]);
+    assert_eq!(stale, vec!["f.rs::RequestKey::Gone"]);
 }
 
 /// True if `struct` or `enum` appears as an IDENT at any depth (a literal

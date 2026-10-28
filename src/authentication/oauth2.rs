@@ -59,7 +59,7 @@ pub struct OAuth2Params {
 impl std::fmt::Debug for OAuth2Params {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuth2Params")
-            .field("issuer_url", &self.issuer_url)
+            .field("issuer_url", &self.issuer_hint())
             .field("credentials_url", &self.credentials_hint())
             .field("audience", &self.audience)
             .field("scope", &self.scope)
@@ -73,7 +73,7 @@ impl Display for OAuth2Params {
         write!(
             f,
             "OAuth2Params({}, {}, {:?}, {:?})",
-            self.issuer_url,
+            self.issuer_hint(),
             self.credentials_hint(),
             self.audience,
             self.scope
@@ -145,6 +145,21 @@ impl OAuth2Params {
                 scheme => format!("{scheme}:{REDACTED}"),
             },
             Err(_) => String::from("<invalid credentials_url>"),
+        }
+    }
+
+    /// The issuer URL as scheme, host, port and path: a query, fragment or
+    /// userinfo can carry a secret.
+    fn issuer_hint(&self) -> String {
+        match Url::parse(self.issuer_url.as_str()) {
+            Ok(url) => {
+                let host = url.host_str().unwrap_or_default();
+                match url.port() {
+                    Some(port) => format!("{}://{host}:{port}{}", url.scheme(), url.path()),
+                    None => format!("{}://{host}{}", url.scheme(), url.path()),
+                }
+            }
+            Err(_) => String::from("<invalid issuer_url>"),
         }
     }
 
@@ -226,20 +241,28 @@ fn error_code(code: &BasicErrorResponseType) -> String {
 }
 
 /// What the oauth2 crate's `Other` detail reports: its fixed messages by name,
-/// a Content-Type only when it is a plain media type.
+/// a Content-Type only from a fixed allow-list (else its length).
 fn other_kind(detail: &str) -> String {
     const CONTENT_TYPE: &str = "unexpected response Content-Type: ";
     if let Some(rest) = detail.strip_prefix(CONTENT_TYPE) {
+        const KNOWN: &[&str] = &[
+            "application/json",
+            "text/html",
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "text/xml",
+            "application/xml",
+        ];
         let media = rest.split('"').nth(1).unwrap_or_default();
-        let plain = !media.is_empty()
-            && media.len() <= 64
-            && media
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b"/+.-".contains(&b));
-        return if plain {
-            format!("unexpected response content-type {media}")
-        } else {
-            format!("unexpected response content-type ({} bytes)", media.len())
+        let essence = media
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        return match KNOWN.iter().find(|k| **k == essence) {
+            Some(known) => format!("unexpected response content-type {known}"),
+            None => format!("unexpected response content-type ({} bytes)", media.len()),
         };
     }
     for fixed in [
@@ -306,6 +329,28 @@ fn transport_kind(e: &HttpClientError<reqwest::Error>) -> String {
     }
 }
 
+/// The error OpenID discovery returns over reqwest.
+type DiscoveryFailure = openidconnect::DiscoveryError<HttpClientError<reqwest::Error>>;
+
+/// An OpenID discovery failure by kind only: a server response, its body and
+/// the request URL (reqwest's `Display`) are never echoed.
+fn discovery_error_kind(e: &DiscoveryFailure) -> String {
+    let kind = match e {
+        openidconnect::DiscoveryError::Request(e) => {
+            format!("request failed: {}", transport_kind(e))
+        }
+        openidconnect::DiscoveryError::Response(status, body, _) => {
+            format!("status {} ({} bytes)", status.as_u16(), body.len())
+        }
+        openidconnect::DiscoveryError::Parse(_) => "unparseable discovery document".to_string(),
+        openidconnect::DiscoveryError::UrlParse(e) => format!("invalid url ({e})"),
+        openidconnect::DiscoveryError::Validation(_) => "invalid discovery document".to_string(),
+        openidconnect::DiscoveryError::Other(detail) => format!("other ({} bytes)", detail.len()),
+        _ => "unknown".to_string(),
+    };
+    format!("discovery failed: {kind}")
+}
+
 #[async_trait]
 impl Authentication for OAuth2Authentication {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -327,7 +372,7 @@ impl Authentication for OAuth2Authentication {
         if let Err(e) = self.token_url().await {
             return Err(AuthenticationError::Custom(format!(
                 "failed to discover OAuth2 token endpoint for issuer [{}]: {e}",
-                self.params.issuer_url
+                self.params.issuer_hint()
             )));
         }
         Ok(())
@@ -362,14 +407,14 @@ impl Authentication for OAuth2Authentication {
                         }
                         return Err(AuthenticationError::Custom(format!(
                             "failed to fetch OAuth2 access token for issuer [{}] (audience={:?}, scope={:?}): {e}",
-                            self.params.issuer_url,
+                            self.params.issuer_hint(),
                             self.params.audience,
                             self.params.scope
                         )));
                     } else {
                         warn!(
                             "failed to refresh OAuth2 token for issuer [{}] (audience={:?}, scope={:?}): {e}. Using existing non-expired token",
-                            self.params.issuer_url,
+                            self.params.issuer_hint(),
                             self.params.audience,
                             self.params.scope
                         );
@@ -389,10 +434,14 @@ impl OAuth2Authentication {
             None => {
                 let client = reqwest::Client::new();
                 let metadata = CoreProviderMetadata::discover_async(
-                    IssuerUrl::from_url(Url::parse(self.params.issuer_url.as_str())?),
+                    IssuerUrl::from_url(
+                        Url::parse(self.params.issuer_url.as_str())
+                            .map_err(|e| format!("invalid issuer url ({e})"))?,
+                    ),
                     &client,
                 )
-                .await?;
+                .await
+                .map_err(|e| discovery_error_kind(&e))?;
                 if let Some(token_endpoint) = metadata.token_endpoint() {
                     self.token_url = Some(token_endpoint.clone());
                     Ok(token_endpoint.clone())
@@ -408,7 +457,7 @@ impl OAuth2Authentication {
         let token_url = self.token_url().await.map_err(|e| {
             AuthenticationError::Retriable(format!(
                 "failed to discover OAuth2 token endpoint for issuer [{}]: {e}",
-                self.params.issuer_url
+                self.params.issuer_hint()
             ))
         })?;
 
@@ -442,9 +491,10 @@ impl OAuth2Authentication {
         let client = reqwest::Client::new();
         let token = request.request_async(&client).await.map_err(|e| {
             let kind = token_error_kind(&e);
-            let error_message = format!(
+            let error_message =
+                format!(
                 "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?}): {kind}",
-                self.params.issuer_url, self.params.audience, self.params.scope
+                self.params.issuer_hint(), self.params.audience, self.params.scope
             );
             if let RequestTokenError::ServerResponse(_) = e {
                 AuthenticationError::Custom(error_message)
@@ -725,15 +775,78 @@ mod tests {
         assert_token_error(format!("{base}/token"), "unexpected response content-type").await;
     }
 
+    /// A port that refuses connections for as long as the returned socket
+    /// lives: bound, never listening, so no other test can take it.
+    fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
     #[tokio::test]
     async fn token_endpoint_refused_connection_names_the_kind_not_the_url() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let (_held, port) = refusing_port();
         assert_token_error(
             format!("http://127.0.0.1:{port}/token?secret={SENTINEL}"),
             "request failed: connect",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_on_initialize_names_the_kind_not_the_issuer_query() {
+        let (_held, port) = refusing_port();
+        let (credentials_url, b64) = sentinel_data_url();
+        let params = OAuth2Params {
+            issuer_url: format!("http://127.0.0.1:{port}/?secret={SENTINEL}"),
+            credentials_url,
+            audience: None,
+            scope: None,
+        };
+        let mut auth = OAuth2Authentication::client_credentials(params);
+        let err = auth.initialize().await.expect_err("discovery must fail");
+        for rendered in [format!("{err}"), format!("{err:?}")] {
+            assert_no_secret(&rendered, &b64);
+            assert!(
+                rendered.contains("discovery failed: request failed: connect"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_on_fetch_names_the_kind_not_the_issuer_query() {
+        let (_held, port) = refusing_port();
+        let mut auth = token_auth("http://127.0.0.1:1/token".to_string());
+        auth.params.issuer_url = format!("http://127.0.0.1:{port}/?secret={SENTINEL}");
+        auth.token_url = None;
+        let err = auth.auth_data().await.expect_err("discovery must fail");
+        for rendered in [format!("{err}"), format!("{err:?}")] {
+            assert_no_secret(&rendered, "unused-b64-marker");
+            assert!(
+                rendered.contains("discovery failed: request failed: connect"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_known_content_type_is_named() {
+        let base = one_shot_http("200 OK", "text/html", "<html></html>".to_string()).await;
+        assert_token_error(
+            format!("{base}/token"),
+            "unexpected response content-type text/html",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_unlisted_plain_content_type_prints_a_length() {
+        let base = one_shot_http("200 OK", "text/x-secretish", r#"{"a":1}"#.to_string()).await;
+        assert_token_error(
+            format!("{base}/token"),
+            "unexpected response content-type (16 bytes)",
         )
         .await;
     }
