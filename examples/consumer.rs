@@ -78,7 +78,7 @@ async fn main() -> Result<(), pulsar::Error> {
         };
 
         if data.data.as_str() != "data" {
-            log::error!("Unexpected payload: {}", &data.data);
+            log::error!("Unexpected payload: {}", data.data);
             break;
         }
         counter += 1;
