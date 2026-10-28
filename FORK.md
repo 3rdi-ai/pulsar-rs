@@ -48,7 +48,8 @@ messages can raise it on purpose.
   name or an extension code by length, a plain Content-Type, the transport
   kind such as connect/timeout/tls/dns, body length), never the URL or the
   token URL, a response body, a server-chosen code or an
-  `error_description`. A source-scan test (`tests/debug_redaction_guard.rs`)
+  `error_description`. The issuer URL prints as scheme, host, port and
+  path only, and discovery errors name their kind the same way. A source-scan test (`tests/debug_redaction_guard.rs`)
   fails if a type under `src/` that holds a credential derives `Debug`.
 
 ## v6.9.1-3rdi.9
