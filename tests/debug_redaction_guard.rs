@@ -10,11 +10,18 @@
 //! The scan parses each file with `syn`, so commented-out derives never count
 //! and an unparseable file fails the test (fail closed). An exemption requires
 //! an entry in [`EXEMPT`] with a non-empty reason; a stale entry also fails.
+//!
+//! Blind spots:
+//! (a) a hand-written `impl Debug` that prints a secret is not inspected (review covers it; the behavioural tests in src/authentication/oauth2.rs cover the known types),
+//! (b) a generic field `T` instantiated with a secret type is not resolved,
+//! (c) types defined inside macro bodies are invisible, which `no_macro_in_src_defines_a_type` keeps fail-closed; (d) `use … as` and `type` aliases resolve only
+//! from a file's top-level items, within that file.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
 
 /// A lowercased field name containing any of these words is secret-bearing.
@@ -25,6 +32,10 @@ const SECRET_FIELD_WORDS: &[&str] = &[
     "credential",
     "private_key",
     "auth_data",
+    "jwt",
+    "bearer",
+    "api_key",
+    "passphrase",
 ];
 
 /// A field whose type path has a segment with exactly one of these idents is
@@ -35,29 +46,114 @@ const SECRET_TYPES: &[&str] = &[
     "AuthData",
     "CommandAuthResponse",
     "CommandAuthChallenge",
+    "Authentication",
+    "CachedToken",
 ];
+
+/// A type (or enum variant) whose lowercased ident contains one of these is
+/// secret-bearing whatever its fields are called.
+const SECRET_TYPE_NAME_WORDS: &[&str] = &["auth", "token", "credential", "secret"];
 
 /// Exemptions as `(type key, reason)`. The key is
 /// `"<path relative to crate root with forward slashes>::<TypeName>"`.
 /// A stale entry (no longer flagged) fails the test.
-const EXEMPT: &[(&str, &str)] = &[];
+const EXEMPT: &[(&str, &str)] = &[
+    (
+        "src/connection.rs::RequestKey",
+        "`AuthChallenge` is a unit variant: a request-routing tag that carries no data",
+    ),
+    (
+        "src/error.rs::AuthenticationError",
+        "holds only error message strings, built kind-only at their source \
+         (src/authentication/oauth2.rs tests assert no secret reaches them)",
+    ),
+    (
+        "src/error.rs::ConnectionError",
+        "flagged for its `Authentication(AuthenticationError)` variant: see that entry",
+    ),
+    (
+        "src/error.rs::Error",
+        "flagged for its `Authentication(AuthenticationError)` variant: see that entry",
+    ),
+];
+
+struct Aliases {
+    secret_types: Vec<String>,
+    debug_names: Vec<String>,
+}
+
+fn collect_aliases(file: &syn::File) -> Aliases {
+    let mut aliases = Aliases {
+        secret_types: Vec::new(),
+        debug_names: vec!["Debug".to_string()],
+    };
+
+    // First pass: collect use renames
+    for item in &file.items {
+        if let syn::Item::Use(item_use) = item {
+            collect_use_aliases(&item_use.tree, &mut aliases);
+        }
+    }
+
+    // Second pass: `type` aliases over a secret type (or an earlier alias)
+    for item in &file.items {
+        if let syn::Item::Type(item_type) = item {
+            let mut visitor = TypeSecretVisitor {
+                found: false,
+                aliases: &aliases,
+            };
+            visitor.visit_type(&item_type.ty);
+            if visitor.found {
+                aliases.secret_types.push(item_type.ident.to_string());
+            }
+        }
+    }
+
+    aliases
+}
+
+fn collect_use_aliases(tree: &syn::UseTree, aliases: &mut Aliases) {
+    match tree {
+        syn::UseTree::Path(p) => collect_use_aliases(&p.tree, aliases),
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                collect_use_aliases(item, aliases);
+            }
+        }
+        // an un-renamed import keeps its ident, which the scan already matches
+        syn::UseTree::Name(_) => {}
+        syn::UseTree::Rename(r) => {
+            let ident_str = r.ident.to_string();
+            if SECRET_TYPES.contains(&ident_str.as_str())
+                || aliases.secret_types.contains(&ident_str)
+            {
+                aliases.secret_types.push(r.rename.to_string());
+            }
+            if r.ident == "Debug" {
+                aliases.debug_names.push(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
 
 /// True if any `derive` attribute lists a path whose last segment is `Debug`,
 /// or any `cfg_attr` attribute contains a `derive(...)` that includes `Debug`.
 ///
 /// Fails closed: a `parse_nested_meta` error panics.
-fn derives_debug(attrs: &[syn::Attribute]) -> bool {
+fn derives_debug(attrs: &[syn::Attribute], aliases: &Aliases) -> bool {
     for attr in attrs {
         if attr.path().is_ident("derive") {
             let mut found = false;
             let result = attr.parse_nested_meta(|meta| {
-                if meta
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|seg| seg.ident == "Debug")
-                {
-                    found = true;
+                if let Some(seg) = meta.path.segments.last() {
+                    if aliases
+                        .debug_names
+                        .iter()
+                        .any(|d| d == &seg.ident.to_string())
+                    {
+                        found = true;
+                    }
                 }
                 Ok(())
             });
@@ -76,8 +172,10 @@ fn derives_debug(attrs: &[syn::Attribute]) -> bool {
             if compact.contains("derive(") {
                 if let Some(idx) = compact.find("derive(") {
                     let after = &compact[idx + "derive(".len()..];
-                    if after.contains("Debug") {
-                        return true;
+                    for name in &aliases.debug_names {
+                        if after.contains(name.as_str()) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -88,7 +186,7 @@ fn derives_debug(attrs: &[syn::Attribute]) -> bool {
 
 /// True if the field name contains a secret word or its type references a
 /// secret-bearing type.
-fn field_is_secret(field: &syn::Field) -> bool {
+fn field_is_secret(field: &syn::Field, aliases: &Aliases) -> bool {
     if let Some(ident) = &field.ident {
         let name = ident.to_string().to_lowercase();
         if SECRET_FIELD_WORDS.iter().any(|w| name.contains(w)) {
@@ -96,18 +194,25 @@ fn field_is_secret(field: &syn::Field) -> bool {
         }
     }
 
-    let mut visitor = TypeSecretVisitor { found: false };
+    let mut visitor = TypeSecretVisitor {
+        found: false,
+        aliases,
+    };
     visitor.visit_type(&field.ty);
     visitor.found
 }
 
-struct TypeSecretVisitor {
+struct TypeSecretVisitor<'a> {
     found: bool,
+    aliases: &'a Aliases,
 }
 
-impl<'ast> Visit<'ast> for TypeSecretVisitor {
+impl<'ast, 'a> Visit<'ast> for TypeSecretVisitor<'a> {
     fn visit_path_segment(&mut self, i: &'ast syn::PathSegment) {
-        if SECRET_TYPES.iter().any(|t| i.ident == *t) {
+        let ident_str = i.ident.to_string();
+        if SECRET_TYPES.contains(&ident_str.as_str())
+            || self.aliases.secret_types.contains(&ident_str)
+        {
             self.found = true;
         }
         syn::visit::visit_path_segment(self, i);
@@ -115,26 +220,43 @@ impl<'ast> Visit<'ast> for TypeSecretVisitor {
 }
 
 /// True if any field in the given fields is secret-bearing.
-fn fields_secret(fields: &syn::Fields) -> bool {
-    fields.iter().any(field_is_secret)
+fn fields_secret(fields: &syn::Fields, aliases: &Aliases) -> bool {
+    fields.iter().any(|f| field_is_secret(f, aliases))
+}
+
+fn ident_is_secret(ident: &syn::Ident) -> bool {
+    let name = ident.to_string().to_lowercase();
+    SECRET_TYPE_NAME_WORDS.iter().any(|w| name.contains(w))
 }
 
 /// Collects flagged types during a `syn` visit.
 struct Scan {
     file: String,
     flagged: Vec<String>,
+    aliases: Aliases,
 }
 
 impl<'ast> Visit<'ast> for Scan {
     fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
-        if derives_debug(&i.attrs) && fields_secret(&i.fields) {
+        if derives_debug(&i.attrs, &self.aliases)
+            && (fields_secret(&i.fields, &self.aliases) || ident_is_secret(&i.ident))
+        {
             self.flagged.push(format!("{}::{}", self.file, i.ident));
         }
         syn::visit::visit_item_struct(self, i);
     }
 
     fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
-        if derives_debug(&i.attrs) && i.variants.iter().any(|v| fields_secret(&v.fields)) {
+        let ident_secret = ident_is_secret(&i.ident);
+        let variant_secret = i.variants.iter().any(|v| {
+            fields_secret(&v.fields, &self.aliases) || {
+                let v_name = v.ident.to_string().to_lowercase();
+                SECRET_TYPE_NAME_WORDS.iter().any(|w| v_name.contains(w))
+                    || SECRET_FIELD_WORDS.iter().any(|w| v_name.contains(w))
+            }
+        });
+
+        if derives_debug(&i.attrs, &self.aliases) && (ident_secret || variant_secret) {
             self.flagged.push(format!("{}::{}", self.file, i.ident));
         }
         syn::visit::visit_item_enum(self, i);
@@ -145,9 +267,11 @@ impl<'ast> Visit<'ast> for Scan {
 fn flag_source(file: &str, src: &str) -> Vec<String> {
     let file_ast = syn::parse_file(src)
         .unwrap_or_else(|e| panic!("{file}: unparseable, the guard fails closed: {e}"));
+    let aliases = collect_aliases(&file_ast);
     let mut scan = Scan {
         file: file.to_string(),
         flagged: Vec::new(),
+        aliases,
     };
     scan.visit_file(&file_ast);
     scan.flagged
@@ -168,14 +292,12 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn no_credential_type_derives_debug() {
+fn src_sources() -> Vec<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rs_files(&root.join("src"), &mut files);
-    assert!(files.len() > 10, "src/ enumeration came back near-empty");
 
-    let mut flagged = Vec::new();
+    let mut sources = Vec::new();
     for path in &files {
         let rel = path
             .strip_prefix(root)
@@ -184,7 +306,31 @@ fn no_credential_type_derives_debug() {
             .replace('\\', "/");
         let src = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        flagged.extend(flag_source(&rel, &src));
+        sources.push((rel, src));
+    }
+    sources
+}
+
+#[test]
+fn no_credential_type_derives_debug() {
+    let sources = src_sources();
+
+    // Check for specific files to ensure enumeration works
+    let rel_paths: Vec<&str> = sources.iter().map(|(p, _)| p.as_str()).collect();
+    for name in &[
+        "src/authentication/oauth2.rs",
+        "src/authentication/basic.rs",
+        "src/connection.rs",
+    ] {
+        assert!(
+            rel_paths.contains(name),
+            "scan missed {name}: the src/ enumeration is broken"
+        );
+    }
+
+    let mut flagged = Vec::new();
+    for (rel, src) in &sources {
+        flagged.extend(flag_source(rel, src));
     }
     flagged.sort();
 
@@ -269,6 +415,146 @@ fn classifier_fixtures() {
         ),
         Vec::<String>::new()
     );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[derive(Debug)] struct Authentication { name: String, data: Vec<u8> }"
+        ),
+        vec!["f.rs::Authentication"]
+    );
+
+    assert_eq!(
+        flag_source("f.rs", "#[derive(Debug)] struct Token(Vec<u8>);"),
+        vec!["f.rs::Token"]
+    );
+
+    assert_eq!(
+        flag_source("f.rs", "#[derive(Debug)] enum Cred { Jwt(String) }"),
+        vec!["f.rs::Cred"]
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "use std::fmt::Debug as D; #[derive(D)] struct S { password: String }"
+        ),
+        vec!["f.rs::S"]
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "use crate::connection::Authentication as A; #[derive(Debug)] struct W { a: A }"
+        ),
+        vec!["f.rs::W"]
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "type Raw = proto::CommandConnect; #[derive(Debug)] struct W { c: Raw }"
+        ),
+        vec!["f.rs::W"]
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[derive(Debug)] struct S { bearer: String, api_key: String }"
+        ),
+        vec!["f.rs::S"]
+    );
+
+    assert_eq!(
+        flag_source("f.rs", "#[derive(Debug)] struct S { key: u32 }"),
+        Vec::<String>::new()
+    );
+
+    assert_eq!(
+        flag_source(
+            "f.rs",
+            "#[derive(Debug)] struct W { c: Option<Box<CachedToken>> }"
+        ),
+        vec!["f.rs::W"]
+    );
+}
+
+fn macro_defines_type(tokens: &TokenStream) -> bool {
+    for tt in tokens.clone() {
+        match tt {
+            TokenTree::Ident(ident) => {
+                if ident == "struct" || ident == "enum" {
+                    // only an ident, never a literal, defines a type
+                    return true;
+                }
+            }
+            TokenTree::Group(g) => {
+                if macro_defines_type(&g.stream()) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+struct MacroScan {
+    file: String,
+    flagged: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for MacroScan {
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if macro_defines_type(&m.tokens) {
+            let name = m
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            self.flagged.push(format!("{}::{}!", self.file, name));
+        }
+        syn::visit::visit_macro(self, m);
+    }
+}
+
+fn macro_types(file: &str, src: &str) -> Vec<String> {
+    let file_ast = syn::parse_file(src)
+        .unwrap_or_else(|e| panic!("{file}: unparseable, the guard fails closed: {e}"));
+    let mut scan = MacroScan {
+        file: file.to_string(),
+        flagged: Vec::new(),
+    };
+    scan.visit_file(&file_ast);
+    scan.flagged
+}
+
+#[test]
+fn no_macro_in_src_defines_a_type() {
+    let sources = src_sources();
+    let mut found = Vec::new();
+    for (rel, src) in &sources {
+        found.extend(macro_types(rel, src));
+    }
+    assert!(
+        found.is_empty(),
+        "a macro in src/ defines a struct or enum; the Debug scan cannot see inside macro bodies, so define the type outside the macro: {found:#?}"
+    );
+}
+
+#[test]
+fn macro_fixtures() {
+    assert_eq!(
+        macro_types("f.rs", "macro_rules! m { () => { struct X; } }"),
+        vec!["f.rs::macro_rules!"]
+    );
+    assert_eq!(
+        macro_types("f.rs", "fn f() { log::debug!(\"a struct and an enum\"); }"),
+        Vec::<String>::new()
+    );
+    assert_eq!(macro_types("f.rs", "m! { enum E { A } }"), vec!["f.rs::m!"]);
 }
 
 #[test]

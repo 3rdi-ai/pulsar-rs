@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use data_url::DataUrl;
 use nom::lib::std::ops::Add;
 use oauth2::{
-    basic::{BasicClient, BasicTokenResponse},
+    basic::{BasicClient, BasicErrorResponse, BasicErrorResponseType, BasicTokenResponse},
     reqwest,
     AuthType::RequestBody,
-    AuthUrl, ClientId, ClientSecret, RequestTokenError, Scope, TokenResponse, TokenUrl,
+    AuthUrl, ClientId, ClientSecret, HttpClientError, RequestTokenError, Scope, TokenResponse,
+    TokenUrl,
 };
 use openidconnect::{core::CoreProviderMetadata, IssuerUrl};
 use serde::Deserialize;
@@ -192,6 +193,119 @@ fn json_error(e: serde_json::Error) -> Box<dyn std::error::Error> {
     ))
 }
 
+/// The token endpoint's error type for a [`BasicClient`] over reqwest.
+type TokenError = RequestTokenError<HttpClientError<reqwest::Error>, BasicErrorResponse>;
+
+/// A token-endpoint failure by kind only. The server picks the `error` code,
+/// `error_description`, body and Content-Type, and reqwest's `Display`
+/// carries the token URL (a query can hold a secret): none is echoed.
+fn token_error_kind(e: &TokenError) -> String {
+    match e {
+        RequestTokenError::ServerResponse(r) => {
+            format!("server rejected the request: {}", error_code(r.error()))
+        }
+        RequestTokenError::Request(e) => format!("request failed: {}", transport_kind(e)),
+        RequestTokenError::Parse(_, body) => {
+            format!("unparseable token response ({} bytes)", body.len())
+        }
+        RequestTokenError::Other(detail) => other_kind(detail),
+    }
+}
+
+/// RFC 6749 §5.2 codes by name; an extension code by length only.
+fn error_code(code: &BasicErrorResponseType) -> String {
+    match code {
+        BasicErrorResponseType::InvalidClient => "invalid_client".into(),
+        BasicErrorResponseType::InvalidGrant => "invalid_grant".into(),
+        BasicErrorResponseType::InvalidRequest => "invalid_request".into(),
+        BasicErrorResponseType::InvalidScope => "invalid_scope".into(),
+        BasicErrorResponseType::UnauthorizedClient => "unauthorized_client".into(),
+        BasicErrorResponseType::UnsupportedGrantType => "unsupported_grant_type".into(),
+        BasicErrorResponseType::Extension(s) => format!("extension({} bytes)", s.len()),
+    }
+}
+
+/// What the oauth2 crate's `Other` detail reports: its fixed messages by name,
+/// a Content-Type only when it is a plain media type.
+fn other_kind(detail: &str) -> String {
+    const CONTENT_TYPE: &str = "unexpected response Content-Type: ";
+    if let Some(rest) = detail.strip_prefix(CONTENT_TYPE) {
+        let media = rest.split('"').nth(1).unwrap_or_default();
+        let plain = !media.is_empty()
+            && media.len() <= 64
+            && media
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b"/+.-".contains(&b));
+        return if plain {
+            format!("unexpected response content-type {media}")
+        } else {
+            format!("unexpected response content-type ({} bytes)", media.len())
+        };
+    }
+    for fixed in [
+        "server returned empty error response",
+        "server returned empty response body",
+    ] {
+        if detail == fixed {
+            return format!("unexpected token response: {fixed}");
+        }
+    }
+    format!(
+        "unexpected token response ({} bytes of detail)",
+        detail.len()
+    )
+}
+
+/// The transport failure's kind, from reqwest's classifiers and the `source()`
+/// chain, never its `Display` (which carries the URL).
+fn transport_kind(e: &HttpClientError<reqwest::Error>) -> String {
+    let e = match e {
+        HttpClientError::Reqwest(e) => e,
+        HttpClientError::Http(_) => return "http".into(),
+        HttpClientError::Io(e) => return format!("io {:?}", e.kind()),
+        HttpClientError::Other(detail) => return format!("other ({} bytes)", detail.len()),
+        _ => return "unknown".into(),
+    };
+    if let Some(status) = e.status() {
+        return format!("status {}", status.as_u16());
+    }
+    // the causes' text is only matched here, never printed
+    let mut chain = Vec::new();
+    let mut io_kind = None;
+    let mut source = std::error::Error::source(e.as_ref());
+    while let Some(s) = source {
+        chain.push(s.to_string().to_ascii_lowercase());
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            io_kind = Some(io.kind());
+        }
+        source = s.source();
+    }
+    let base = if e.is_timeout() {
+        "timeout"
+    } else if chain.iter().any(|s| s.contains("dns error")) {
+        "dns"
+    } else if chain
+        .iter()
+        .any(|s| s.contains("tls") || s.contains("certificate"))
+    {
+        "tls"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_body() || e.is_decode() {
+        "body"
+    } else if e.is_builder() {
+        "builder"
+    } else {
+        "request"
+    };
+    match io_kind {
+        Some(kind) => format!("{base} ({kind:?})"),
+        None => base.to_string(),
+    }
+}
+
 #[async_trait]
 impl Authentication for OAuth2Authentication {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -327,16 +441,7 @@ impl OAuth2Authentication {
 
         let client = reqwest::Client::new();
         let token = request.request_async(&client).await.map_err(|e| {
-            let kind = match &e {
-                RequestTokenError::ServerResponse(r) => {
-                    format!("server rejected the request: {}", r.error())
-                }
-                RequestTokenError::Request(e) => format!("request failed: {e}"),
-                RequestTokenError::Parse(_, body) => {
-                    format!("unparseable token response ({} bytes)", body.len())
-                }
-                RequestTokenError::Other(e) => format!("unexpected token response: {e}"),
-            };
+            let kind = token_error_kind(&e);
             let error_message = format!(
                 "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?}): {kind}",
                 self.params.issuer_url, self.params.audience, self.params.scope
@@ -477,7 +582,11 @@ mod tests {
         }
     }
 
-    async fn one_shot_http(status_line: &'static str, body: String) -> String {
+    async fn one_shot_http(
+        status_line: &'static str,
+        content_type: &'static str,
+        body: String,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -486,11 +595,38 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = socket.read(&mut buf).await;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let headers = String::from_utf8_lossy(&buf[..sep_pos]);
+            let mut content_length = 0usize;
+            for line in headers.lines() {
+                if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = rest.trim().parse().unwrap_or(0);
+                }
+            }
+            let body_start = sep_pos + 4;
+            while buf.len() - body_start < content_length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 status_line,
+                content_type,
                 body.len(),
                 body
             );
@@ -498,46 +634,123 @@ mod tests {
             let _ = socket.shutdown().await;
         });
 
-        format!("http://127.0.0.1:{port}/token")
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn token_auth(token_url: String) -> OAuth2Authentication {
+        let params = OAuth2Params {
+            issuer_url: "http://127.0.0.1:1".to_string(),
+            credentials_url: "data:,".to_string(),
+            audience: None,
+            scope: None,
+        };
+        let private_params = OAuth2PrivateParams {
+            client_id: "cid".to_string(),
+            client_secret: "other".to_string(),
+            client_email: None,
+            issuer_url: None,
+        };
+        OAuth2Authentication {
+            params,
+            private_params: Some(private_params),
+            token_url: Some(TokenUrl::new(token_url).unwrap()),
+            token: None,
+        }
+    }
+
+    async fn assert_token_error(token_url: String, expected_kind: &str) {
+        let mut auth = token_auth(token_url);
+        let err = auth
+            .auth_data()
+            .await
+            .expect_err("token endpoint failure must surface");
+        for rendered in [format!("{err}"), format!("{err:?}")] {
+            assert_no_secret(&rendered, "unused-b64-marker");
+            assert!(
+                rendered.contains(expected_kind),
+                "expected kind {expected_kind:?} in: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn token_endpoint_errors_carry_no_secret() {
-        let cases = [
-            ("200 OK", format!(r#"{{"access_token":"{SENTINEL}""#)),
-            (
-                "400 Bad Request",
-                format!(r#"{{"error":"invalid_client","error_description":"{SENTINEL}"}}"#),
-            ),
-        ];
-        for (status_line, body) in cases {
-            let url = one_shot_http(status_line, body).await;
-            let params = OAuth2Params {
-                issuer_url: "http://127.0.0.1:1".to_string(),
-                credentials_url: "data:,".to_string(),
-                audience: None,
-                scope: None,
-            };
-            let private_params = OAuth2PrivateParams {
-                client_id: "cid".to_string(),
-                client_secret: "other".to_string(),
-                client_email: None,
-                issuer_url: None,
-            };
-            let mut auth = OAuth2Authentication {
-                params,
-                private_params: Some(private_params),
-                token_url: Some(TokenUrl::new(url).unwrap()),
-                token: None,
-            };
-            let err = auth
-                .auth_data()
-                .await
-                .expect_err("token endpoint failure must surface");
-            for rendered in [format!("{err}"), format!("{err:?}")] {
-                assert_no_secret(&rendered, "unused-b64-marker");
-            }
-        }
+    async fn token_endpoint_unparseable_body_names_the_kind() {
+        let base = one_shot_http(
+            "200 OK",
+            "application/json",
+            format!(r#"{{"access_token":"{SENTINEL}""#),
+        )
+        .await;
+        assert_token_error(format!("{base}/token"), "unparseable token response").await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_error_description_is_not_echoed() {
+        let base = one_shot_http(
+            "400 Bad Request",
+            "application/json",
+            format!(r#"{{"error":"invalid_client","error_description":"{SENTINEL}"}}"#),
+        )
+        .await;
+        assert_token_error(
+            format!("{base}/token"),
+            "server rejected the request: invalid_client",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_extension_error_code_is_not_echoed() {
+        let base = one_shot_http(
+            "400 Bad Request",
+            "application/json",
+            format!(r#"{{"error":"{SENTINEL}"}}"#),
+        )
+        .await;
+        assert_token_error(
+            format!("{base}/token"),
+            &format!("extension({} bytes)", SENTINEL.len()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_unexpected_content_type_is_not_echoed() {
+        let base = one_shot_http(
+            "200 OK",
+            "text/S3CR3T-SENTINEL",
+            r#"{"access_token":"x","token_type":"bearer"}"#.to_string(),
+        )
+        .await;
+        assert_token_error(format!("{base}/token"), "unexpected response content-type").await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_refused_connection_names_the_kind_not_the_url() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert_token_error(
+            format!("http://127.0.0.1:{port}/token?secret={SENTINEL}"),
+            "request failed: connect",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_parse_failure_does_not_echo_the_url() {
+        let base = one_shot_http(
+            "200 OK",
+            "application/json",
+            format!(r#"{{"access_token":"{SENTINEL}""#),
+        )
+        .await;
+        assert_token_error(
+            format!("{base}/token?secret={SENTINEL}"),
+            "unparseable token response",
+        )
+        .await;
     }
 
     #[test]

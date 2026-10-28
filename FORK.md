@@ -44,8 +44,10 @@ messages can raise it on purpose.
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
   its path), the private OAuth2 params and `BasicAuthentication` print
   `<redacted>` for the secret, and credentials-read and token-endpoint
-  errors name the failure kind (parse position, http error code, body
-  length), never the URL contents, a response body or an
+  errors name the failure kind (parse position, an RFC 6749 error code by
+  name or an extension code by length, a plain Content-Type, the transport
+  kind such as connect/timeout/tls/dns, body length), never the URL or the
+  token URL, a response body, a server-chosen code or an
   `error_description`. A source-scan test (`tests/debug_redaction_guard.rs`)
   fails if a type under `src/` that holds a credential derives `Debug`.
 
