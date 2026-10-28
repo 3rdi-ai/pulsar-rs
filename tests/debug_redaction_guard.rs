@@ -480,24 +480,14 @@ fn classifier_fixtures() {
     );
 }
 
+/// True if `struct` or `enum` appears as an IDENT at any depth (a literal
+/// such as a log message never counts).
 fn macro_defines_type(tokens: &TokenStream) -> bool {
-    for tt in tokens.clone() {
-        match tt {
-            TokenTree::Ident(ident) => {
-                if ident == "struct" || ident == "enum" {
-                    // only an ident, never a literal, defines a type
-                    return true;
-                }
-            }
-            TokenTree::Group(g) => {
-                if macro_defines_type(&g.stream()) {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
+    tokens.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(ident) => ident == "struct" || ident == "enum",
+        TokenTree::Group(g) => macro_defines_type(&g.stream()),
+        _ => false,
+    })
 }
 
 struct MacroScan {
