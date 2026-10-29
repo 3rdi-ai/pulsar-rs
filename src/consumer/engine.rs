@@ -880,7 +880,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     self.debug_format()
                 );
 
-                self.reconnect().await?;
+                // FORK-PATCH (3rdi): as every other reconnect: a transient
+                // failure is retried on the backoff, a permanent one ends
+                // the consumer (upstream sent the error to the stream and
+                // never retried, leaving the consumer with no subscription)
+                if let Err(e) = self.reconnect().await {
+                    if !reconnect_is_transient(&e) {
+                        self.end_with(e);
+                        return Ok(false);
+                    }
+                    self.log_retry(&e, Pending::ConnectionRetry);
+                    self.schedule_resubscribe(true, Pending::ConnectionRetry);
+                }
             }
             unexpected => {
                 let r#type = proto::base_command::Type::try_from(unexpected.command.r#type)
@@ -1643,17 +1654,19 @@ mod tests {
         );
     }
 
-    /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close that
-    /// fails sends its error to the stream and is not retried: the engine
-    /// goes on with no subscription and "reconnecting" stays set (as
-    /// documented on `Consumer::is_reconnecting`).
-    #[tokio::test]
+    /// An engine on a live connection (a broker answering Connect and
+    /// Ping), with its messages sender and receive queue.
     #[cfg(any(
         feature = "tokio-runtime",
         feature = "tokio-rustls-runtime-aws-lc-rs",
         feature = "tokio-rustls-runtime-ring"
     ))]
-    async fn a_failed_reconnect_on_a_broker_close_freezes_the_signal() {
+    async fn engine_on_a_live_connection() -> (
+        ConsumerEngine<crate::TokioExecutor>,
+        mpsc::UnboundedSender<RawMessage>,
+        crate::consumer::queue::QueueReceiver,
+        mpsc::UnboundedSender<EngineMessage<crate::TokioExecutor>>,
+    ) {
         use futures::SinkExt;
         use tokio::net::TcpListener;
 
@@ -1708,10 +1721,10 @@ mod tests {
             .await
             .unwrap();
         let conn = client.manager.get_base_connection().await.unwrap();
-        let (tx, mut rx) = receive_queue(10, 1 << 20);
+        let (tx, rx) = receive_queue(10, 1 << 20);
         let (messages_tx, messages_rx) = mpsc::unbounded();
-        let (_engine_tx, engine_rx) = mpsc::unbounded();
-        let mut engine = ConsumerEngine::new(
+        let (engine_tx, engine_rx) = mpsc::unbounded();
+        let engine = ConsumerEngine::new(
             client,
             conn,
             "persistent://t/n/x".to_string(),
@@ -1727,33 +1740,74 @@ mod tests {
             None,
             ConsumerOptions::default(),
         );
-        let signal = engine.reconnect_signal();
-        engine.reconnect_failures.store(1, Ordering::SeqCst);
-        messages_tx
-            .unbounded_send(Message {
-                command: BaseCommand {
-                    r#type: 23,
-                    close_consumer: Some(CommandCloseConsumer {
-                        consumer_id: 1,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                payload: None,
-            })
-            .unwrap();
+        (engine, messages_tx, rx, engine_tx)
+    }
 
+    fn broker_close() -> RawMessage {
+        RawMessage {
+            command: BaseCommand {
+                r#type: 23,
+                close_consumer: Some(CommandCloseConsumer {
+                    consumer_id: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payload: None,
+        }
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close (every
+    /// topic unload or bundle move) that fails transiently is retried on the
+    /// backoff; upstream sent the error to the stream and never retried, so
+    /// the consumer sat with no subscription.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_reconnect_on_a_broker_close_is_retried() {
+        let (mut engine, messages_tx, _rx, _engine_tx) = engine_on_a_live_connection().await;
+        let signal = engine.reconnect_signal();
         let mut injected = engine.injected_rx.take().unwrap();
-        run_until_injected(&mut engine, &mut injected, 1).await;
-        // the error reaches the stream once the engine has queued it
-        let ran = tokio::time::timeout(Duration::from_millis(500), engine.engine()).await;
-        assert!(ran.is_err(), "the engine ended");
-        assert!(
-            matches!(rx.next().await, Some(Err(_))),
-            "the error reached the stream"
-        );
-        assert_eq!(signal.attempts(), 1, "the reconnect was not retried");
-        assert!(signal.is_reconnecting(), "the flag stays set");
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+        messages_tx.unbounded_send(broker_close()).unwrap();
+
+        run_until_injected(&mut engine, &mut injected, 3).await;
+        assert_eq!(signal.attempts(), 3, "the reconnect was retried");
+        assert!(signal.is_reconnecting());
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close that
+    /// fails for good ends the consumer: the stream yields the error, then
+    /// ends, and the consumer is no longer reconnecting.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_permanently_failed_reconnect_on_a_broker_close_ends_the_consumer() {
+        let (mut engine, messages_tx, mut rx, _engine_tx) = engine_on_a_live_connection().await;
+        let signal = engine.reconnect_signal();
+        engine.injected_permanent = true;
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        messages_tx.unbounded_send(broker_close()).unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), engine.engine())
+            .await
+            .expect("the engine went on after a permanent failure");
+        assert!(ended.is_ok(), "{ended:?}");
+        drop(engine);
+        assert!(matches!(
+            rx.next().await,
+            Some(Err(Error::ServiceDiscovery(
+                crate::error::ServiceDiscoveryError::NotFound
+            )))
+        ));
+        assert!(rx.next().await.is_none(), "the stream did not end");
+        assert!(!signal.is_reconnecting());
     }
 
     /// FORK-PATCH (3rdi): a permanent failure of that reconnect (here the
