@@ -1074,6 +1074,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// FORK-PATCH (3rdi): logs a reconnect that failed and is retried, for
     /// both retry branches: at `error!` once the same TLS-transient failure
     /// repeats [`TLS_TRANSIENT_ESCALATE_AFTER`] times in a row, else `warn!`.
+    /// Once escalated, every later retry of that failure logs at `error!`
+    /// too, about once a minute at the capped backoff: intended, a TLS
+    /// misconfiguration stays loud until it is fixed.
     fn log_retry(&mut self, e: &Error, pending: Pending) {
         if self.tls_streak.record(tls_transient_label(e)) {
             error!(
