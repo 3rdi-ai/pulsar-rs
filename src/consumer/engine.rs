@@ -343,6 +343,10 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Test seam: the injected failures are permanent (topic not found).
     #[cfg(test)]
     injected_permanent: bool,
+    /// Test seam: the injected failure, when set (else a transient timeout
+    /// or, with `injected_permanent`, NotFound).
+    #[cfg(test)]
+    injected_error: Option<fn() -> Error>,
     /// Test seam: a notification per injected reconnect failure.
     #[cfg(test)]
     injected_tx: mpsc::UnboundedSender<()>,
@@ -412,6 +416,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             reconnect_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
             injected_permanent: false,
+            #[cfg(test)]
+            injected_error: None,
             #[cfg(test)]
             injected_tx,
             #[cfg(test)]
@@ -489,15 +495,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     if !reconnect_is_transient(&e) {
                         return Err(self.end_with(e));
                     }
-                    if self.tls_streak.record(tls_transient_label(&e)) {
-                        error!(
-                            "{}: reconnect failed: {e}; retrying (the same TLS failure {} times in a row: check the broker's TLS configuration)",
-                            self.debug_format(),
-                            self.tls_streak.count
-                        );
-                    } else {
-                        warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
-                    }
+                    self.log_retry(&e, Pending::ConnectionRetry);
                     self.schedule_resubscribe(true, Pending::ConnectionRetry);
                 }
             }
@@ -512,11 +510,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     if !reconnect_is_transient(&e) {
                         return Err(self.end_with(e));
                     }
-                    warn!(
-                        "{}: {} and the resubscribe failed: {e}; retrying",
-                        self.debug_format(),
-                        pending.reason()
-                    );
+                    self.log_retry(&e, pending);
                     self.schedule_resubscribe(true, pending);
                 }
             }
@@ -1077,6 +1071,26 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         );
     }
 
+    /// FORK-PATCH (3rdi): logs a reconnect that failed and is retried, for
+    /// both retry branches: at `error!` once the same TLS-transient failure
+    /// repeats [`TLS_TRANSIENT_ESCALATE_AFTER`] times in a row, else `warn!`.
+    fn log_retry(&mut self, e: &Error, pending: Pending) {
+        if self.tls_streak.record(tls_transient_label(e)) {
+            error!(
+                "{}: {}, and the reconnect failed: {e}; retrying (the same TLS failure {} times in a row: check the broker's TLS configuration)",
+                self.debug_format(),
+                pending.reason(),
+                self.tls_streak.count
+            );
+        } else {
+            warn!(
+                "{}: {}, and the reconnect failed: {e}; retrying",
+                self.debug_format(),
+                pending.reason()
+            );
+        }
+    }
+
     /// FORK-PATCH (3rdi): ends the engine on a reconnect that failed for
     /// good. The error goes to the consumer's stream, which yields it and
     /// then ends (the engine's own result is only logged by its task);
@@ -1147,6 +1161,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .is_ok()
         {
             let _ = self.injected_tx.unbounded_send(());
+            if let Some(injected) = self.injected_error {
+                return Err(injected());
+            }
             return Err(if self.injected_permanent {
                 Error::ServiceDiscovery(crate::error::ServiceDiscoveryError::NotFound)
             } else {
@@ -1426,6 +1443,43 @@ mod tests {
             let err = Error::Connection(ConnectionError::Tls(tls));
             assert_eq!(reconnect_is_transient(&err), transient, "{err:?}");
         }
+    }
+
+    /// FORK-PATCH (3rdi): an engine whose reconnects keep failing with the
+    /// same TLS-transient error escalates, however the retries are driven
+    /// (the first off the failed connection, the rest as pending connection
+    /// retries).
+    #[tokio::test]
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        any(
+            feature = "tokio-runtime",
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring"
+        )
+    ))]
+    async fn repeated_tls_transient_reconnect_failures_escalate() {
+        let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        engine.injected_error = Some(|| {
+            Error::Connection(ConnectionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(rustls::AlertDescription::InternalError),
+            )))
+        });
+        let failures = TLS_TRANSIENT_ESCALATE_AFTER + 1;
+        engine.reconnect_failures.store(failures, Ordering::SeqCst);
+        // the last failure is recorded before the next one fires
+        run_until_injected(&mut engine, &mut injected, failures as usize).await;
+        assert!(
+            engine.tls_streak.count >= TLS_TRANSIENT_ESCALATE_AFTER,
+            "the streak did not escalate: {} in a row",
+            engine.tls_streak.count
+        );
     }
 
     /// FORK-PATCH (3rdi): the same TLS-transient failure escalates on its
