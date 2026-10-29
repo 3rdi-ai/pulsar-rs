@@ -192,6 +192,21 @@ messages can raise it on purpose.
   waiters keep the rustls error in their copy (`copy_io_error`), so they
   classify it the same way. Only the consumer engine's reconnect uses
   this classification; producers do not.
+- **Known broker race: ack-then-seek can lose the reset** (not fixed in
+  the client): acknowledging messages and then seeking (by timestamp or
+  message id) right away can leave the subscription where the acks put it.
+  The broker saves the acks' mark-delete position asynchronously (the
+  first save also creates the cursor ledger); a seek that arrives while
+  that save is in flight has its own mark-delete skipped ("Skipping mark
+  delete update, in-progress position is later"), and the late save then
+  wins, so messages the seek should redeliver are not. Seen on 5.0.0
+  (fork PR #2). An application that seeks right after acknowledging
+  should unload the topic first (closing the cursor waits for pending
+  saves) or verify the redelivery; `seek_single_consumer` does the former.
+- **Deferred from review (#13):** the panic-after-give-up arm of
+  `dial_detached` (`Err(_) if gave_up => return`) has no test: it needs a
+  dial that panics after it already gave up, which the dial-panic and
+  give-up test seams do not combine.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
