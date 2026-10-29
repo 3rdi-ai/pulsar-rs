@@ -201,6 +201,12 @@ impl ReconnectSignal {
         self.reconnecting.load(Ordering::Relaxed)
     }
 
+    /// Carries the attempts of the consumer this one replaces (a seek
+    /// rebuilds it), so the count only goes up.
+    pub(crate) fn carry(&self, attempts: u64) {
+        self.attempts.fetch_add(attempts, Ordering::Relaxed);
+    }
+
     fn started(&self) {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         self.reconnecting.store(true, Ordering::Relaxed);
@@ -1635,6 +1641,119 @@ mod tests {
             !signal.is_reconnecting(),
             "an ended engine is not reconnecting"
         );
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close that
+    /// fails sends its error to the stream and is not retried: the engine
+    /// goes on with no subscription and "reconnecting" stays set (as
+    /// documented on `Consumer::is_reconnecting`).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_reconnect_on_a_broker_close_freezes_the_signal() {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            connection_manager::OperationRetryOptions,
+            consumer::queue::receive_queue,
+            message::{BaseCommand, Codec, Message},
+            proto::{CommandConnected, CommandPong},
+            Pulsar, TokioExecutor,
+        };
+
+        // a broker that answers Connect and Ping: the connection stays live
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: 3,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if msg.command.ping.is_some() {
+                            BaseCommand {
+                                r#type: 19,
+                                pong: Some(CommandPong::default()),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        let reply = Message {
+                            command: reply,
+                            payload: None,
+                        };
+                        if framed.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        let (tx, mut rx) = receive_queue(10, 1 << 20);
+        let (messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        let signal = engine.reconnect_signal();
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        messages_tx
+            .unbounded_send(Message {
+                command: BaseCommand {
+                    r#type: 23,
+                    close_consumer: Some(CommandCloseConsumer {
+                        consumer_id: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                payload: None,
+            })
+            .unwrap();
+
+        let mut injected = engine.injected_rx.take().unwrap();
+        run_until_injected(&mut engine, &mut injected, 1).await;
+        // the error reaches the stream once the engine has queued it
+        let ran = tokio::time::timeout(Duration::from_millis(500), engine.engine()).await;
+        assert!(ran.is_err(), "the engine ended");
+        assert!(
+            matches!(rx.next().await, Some(Err(_))),
+            "the error reached the stream"
+        );
+        assert_eq!(signal.attempts(), 1, "the reconnect was not retried");
+        assert!(signal.is_reconnecting(), "the flag stays set");
     }
 
     /// FORK-PATCH (3rdi): a permanent failure of that reconnect (here the

@@ -306,6 +306,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 config,
                 disc_last_message_received: None,
                 disc_messages_received: 0,
+                disc_reconnect_attempts: 0,
             };
             if consumer.topic_regex.is_some() {
                 consumer.update_topics();

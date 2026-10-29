@@ -217,8 +217,12 @@ messages can raise it on purpose.
   engine now counts every reconnect (resubscribe) attempt it starts and
   holds "reconnecting" from the start of one until one succeeds or the
   engine ends; both are atomics read lock-free, and nothing else changes.
-  A multi-topic consumer reports the sum and the any over the topics it
-  currently consumes.
+  The count only goes up: a seek (which rebuilds the consumer) and a
+  multi-topic consumer dropping a topic keep the attempts already counted;
+  "reconnecting" is any over a multi-topic consumer's current topics. The
+  flag stays set (frozen) if the engine panics or returns `Ok(())`, and
+  after a failed reconnect on a broker-initiated close, which is not
+  retried (its error goes to the stream).
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
