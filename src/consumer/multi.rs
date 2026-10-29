@@ -38,9 +38,29 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     // Stats on disconnected consumers to keep metrics correct
     pub(super) disc_messages_received: u64,
     pub(super) disc_last_message_received: Option<DateTime<Utc>>,
+    /// FORK-PATCH (3rdi): the reconnect attempts of consumers no longer
+    /// here, so the consumer's count only goes up.
+    pub(super) disc_reconnect_attempts: u64,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
+    /// FORK-PATCH (3rdi): the reconnect attempts of every topic consumer
+    /// this consumer has had; it only goes up.
+    pub fn reconnect_attempts(&self) -> u64 {
+        self.disc_reconnect_attempts
+            + self
+                .consumers
+                .values()
+                .map(|c| c.reconnect_attempts())
+                .sum::<u64>()
+    }
+
+    /// FORK-PATCH (3rdi): whether any current topic consumer is
+    /// reconnecting.
+    pub fn is_reconnecting(&self) -> bool {
+        self.consumers.values().any(|c| c.is_reconnecting())
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn topics(&self) -> Vec<String> {
         self.topics.iter().map(|s| s.to_string()).collect()
@@ -132,6 +152,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         for topic in topics {
             if let Some(consumer) = self.consumers.remove(topic) {
                 self.disc_messages_received += consumer.messages_received;
+                self.disc_reconnect_attempts += consumer.reconnect_attempts();
                 self.disc_last_message_received = self
                     .disc_last_message_received
                     .into_iter()
@@ -402,5 +423,50 @@ impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsum
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod reconnect_signal_tests {
+    use super::*;
+
+    /// FORK-PATCH (3rdi): dropping a topic keeps its reconnect attempts in
+    /// the multi-topic consumer's count, which only goes up.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn dropping_a_topic_keeps_its_reconnect_attempts() {
+        use crate::{connection_manager::tests::silent_broker, TokioExecutor};
+
+        let (url, _seen) = silent_broker::listen().await;
+        let pulsar = Pulsar::builder(url, TokioExecutor).build().await.unwrap();
+        let mut consumers = BTreeMap::new();
+        consumers.insert("a".to_string(), Box::pin(TopicConsumer::detached("a", 3)));
+        consumers.insert("b".to_string(), Box::pin(TopicConsumer::detached("b", 4)));
+        let mut multi: MultiTopicConsumer<Vec<u8>, TokioExecutor> = MultiTopicConsumer {
+            namespace: "public/default".to_string(),
+            topic_regex: None,
+            pulsar,
+            consumers,
+            topics: ["a".to_string(), "b".to_string()].into(),
+            existing_topics: ["a".to_string(), "b".to_string()].into(),
+            new_consumers: None,
+            refresh: Box::pin(futures::stream::pending()),
+            config: Default::default(),
+            disc_messages_received: 0,
+            disc_last_message_received: None,
+            disc_reconnect_attempts: 0,
+        };
+        assert_eq!(multi.reconnect_attempts(), 7);
+
+        multi.remove_consumers(&["a".to_string()]);
+        assert_eq!(
+            multi.reconnect_attempts(),
+            7,
+            "dropping a topic lowered the count"
+        );
     }
 }

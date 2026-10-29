@@ -180,6 +180,43 @@ fn tls_transient_label(e: &Error) -> Option<String> {
     }
 }
 
+/// FORK-PATCH (3rdi): what the engine tells the application about its
+/// reconnects, read lock-free from the consumer: a transient reconnect
+/// failure is retried inside the engine and never reaches the stream.
+#[derive(Debug, Default)]
+pub(crate) struct ReconnectSignal {
+    /// Every reconnect (resubscribe) attempt the engine started.
+    attempts: AtomicU64,
+    /// From the start of a reconnect until one succeeds (or the engine
+    /// ends): set while the consumer has no working subscription.
+    reconnecting: std::sync::atomic::AtomicBool,
+}
+
+impl ReconnectSignal {
+    pub(crate) fn attempts(&self) -> u64 {
+        self.attempts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::Relaxed)
+    }
+
+    /// Carries the attempts of the consumer this one replaces (a seek
+    /// rebuilds it), so the count only goes up.
+    pub(crate) fn carry(&self, attempts: u64) {
+        self.attempts.fetch_add(attempts, Ordering::Relaxed);
+    }
+
+    fn started(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        self.reconnecting.store(true, Ordering::Relaxed);
+    }
+
+    fn settled(&self) {
+        self.reconnecting.store(false, Ordering::Relaxed);
+    }
+}
+
 /// FORK-PATCH (3rdi): why a resubscribe is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -325,6 +362,8 @@ pub struct ConsumerEngine<Exe: Executor> {
     options: ConsumerOptions,
     /// How many forced resubscribes have been scheduled.
     forced_resubscribes: Arc<AtomicU64>,
+    /// FORK-PATCH (3rdi): the reconnect signal, shared with the consumer.
+    reconnect_signal: Arc<ReconnectSignal>,
     /// The current subscription session: bumped by every resubscribe, in
     /// step with the receive queue's. A message from an older session is
     /// dropped (the broker redelivers it on this one, which never charged
@@ -404,6 +443,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             dead_letter_policy,
             options,
             forced_resubscribes: Arc::new(AtomicU64::new(0)),
+            reconnect_signal: Arc::default(),
             generation: 0,
             forced: ForcedResubscribe::default(),
             tls_streak: TlsStreak::default(),
@@ -427,6 +467,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             #[cfg(test)]
             resubscribed_rx: Some(resubscribed_rx),
         }
+    }
+
+    /// FORK-PATCH (3rdi): the reconnect signal, shared with the consumer.
+    pub(crate) fn reconnect_signal(&self) -> Arc<ReconnectSignal> {
+        Arc::clone(&self.reconnect_signal)
     }
 
     /// The count of forced resubscribes scheduled, shared with the consumer.
@@ -1099,6 +1144,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// then ends (the engine's own result is only logged by its task);
     /// returns a summary for that log.
     fn end_with(&mut self, e: Error) -> Error {
+        self.reconnect_signal.settled();
         error!("{}: reconnect failed for good: {e}", self.debug_format());
         let summary = Error::Custom(format!("the consumer ended: {e}"));
         if !self.tx.try_send_error(e) {
@@ -1113,6 +1159,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
+        self.reconnect_signal.started();
 
         // A new session before the old one is closed: whatever it already
         // sent, queued or not, is dropped from here on.
@@ -1200,6 +1247,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
         self.forced.completed(Instant::now());
         self.tls_streak.reset();
+        self.reconnect_signal.settled();
         self.remaining_messages = self.batch_size as i64;
         self.messages_rx = Some(messages);
 
@@ -1560,6 +1608,152 @@ mod tests {
         let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
         engine.reconnect_failures.store(3, Ordering::SeqCst);
         run_until_injected(&mut engine, &mut injected, 3).await;
+    }
+
+    /// FORK-PATCH (3rdi): the reconnect signal: every attempt counts, and
+    /// the consumer reads "reconnecting" while transient failures are
+    /// retried; an engine that ends for good is no longer reconnecting.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn the_reconnect_signal_follows_the_retries() {
+        let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        let signal = engine.reconnect_signal();
+        assert_eq!(signal.attempts(), 0);
+        assert!(!signal.is_reconnecting());
+
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+        run_until_injected(&mut engine, &mut injected, 3).await;
+        assert_eq!(signal.attempts(), 3);
+        assert!(signal.is_reconnecting(), "retries are under way");
+
+        engine.injected_permanent = true;
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        let ended = tokio::time::timeout(Duration::from_secs(10), engine.engine())
+            .await
+            .expect("a permanent failure was retried");
+        assert!(ended.is_err());
+        assert!(signal.attempts() >= 4);
+        assert!(
+            !signal.is_reconnecting(),
+            "an ended engine is not reconnecting"
+        );
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close that
+    /// fails sends its error to the stream and is not retried: the engine
+    /// goes on with no subscription and "reconnecting" stays set (as
+    /// documented on `Consumer::is_reconnecting`).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_reconnect_on_a_broker_close_freezes_the_signal() {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            connection_manager::OperationRetryOptions,
+            consumer::queue::receive_queue,
+            message::{BaseCommand, Codec, Message},
+            proto::{CommandConnected, CommandPong},
+            Pulsar, TokioExecutor,
+        };
+
+        // a broker that answers Connect and Ping: the connection stays live
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: 3,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if msg.command.ping.is_some() {
+                            BaseCommand {
+                                r#type: 19,
+                                pong: Some(CommandPong::default()),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        let reply = Message {
+                            command: reply,
+                            payload: None,
+                        };
+                        if framed.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        let (tx, mut rx) = receive_queue(10, 1 << 20);
+        let (messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        let signal = engine.reconnect_signal();
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        messages_tx
+            .unbounded_send(Message {
+                command: BaseCommand {
+                    r#type: 23,
+                    close_consumer: Some(CommandCloseConsumer {
+                        consumer_id: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                payload: None,
+            })
+            .unwrap();
+
+        let mut injected = engine.injected_rx.take().unwrap();
+        run_until_injected(&mut engine, &mut injected, 1).await;
+        // the error reaches the stream once the engine has queued it
+        let ran = tokio::time::timeout(Duration::from_millis(500), engine.engine()).await;
+        assert!(ran.is_err(), "the engine ended");
+        assert!(
+            matches!(rx.next().await, Some(Err(_))),
+            "the error reached the stream"
+        );
+        assert_eq!(signal.attempts(), 1, "the reconnect was not retried");
+        assert!(signal.is_reconnecting(), "the flag stays set");
     }
 
     /// FORK-PATCH (3rdi): a permanent failure of that reconnect (here the

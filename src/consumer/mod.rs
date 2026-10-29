@@ -202,7 +202,10 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
                 let topic = c.topic().to_string();
                 let addr = client.lookup_topic(&topic).await?;
                 let config = c.config().clone();
-                InnerConsumer::Single(TopicConsumer::new(client, topic, addr, config).await?)
+                let replacement = TopicConsumer::new(client, topic, addr, config).await?;
+                // the old count as of the swap (its engine may still count)
+                replacement.carry_reconnect_attempts(c.reconnect_attempts());
+                InnerConsumer::Single(replacement)
             }
             InnerConsumer::Multi(c) => {
                 c.seek(consumer_ids, message_id, timestamp).await?;
@@ -244,6 +247,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
                     config,
                     disc_last_message_received: None,
                     disc_messages_received: 0,
+                    disc_reconnect_attempts: c.reconnect_attempts(),
                 })
             }
         };
@@ -273,6 +277,35 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         match &mut self.inner {
             InnerConsumer::Single(c) => Ok(vec![c.get_last_message_id().await?]),
             InnerConsumer::Multi(c) => c.get_last_message_id().await,
+        }
+    }
+
+    /// FORK-PATCH (3rdi): how many reconnects (resubscribes) this
+    /// consumer has started: a transient reconnect failure is retried inside
+    /// the engine and never reaches the stream, so this is how an
+    /// application sees one. An attempt counts when it starts (forced
+    /// resubscribes too). The count only goes up: a seek, which rebuilds
+    /// the consumer, and a multi-topic consumer dropping a topic keep the
+    /// attempts already counted. Lock-free.
+    pub fn reconnect_attempts(&self) -> u64 {
+        match &self.inner {
+            InnerConsumer::Single(c) => c.reconnect_attempts(),
+            InnerConsumer::Multi(c) => c.reconnect_attempts(),
+        }
+    }
+
+    /// FORK-PATCH (3rdi): whether a reconnect is under way: set when one
+    /// starts, cleared when one succeeds or when the engine ends with an
+    /// error (a permanent failure). It stays as it was (frozen) if the
+    /// engine panics or returns `Ok(())` (the consumer was closed or
+    /// dropped), and after a failed reconnect on a broker-initiated close:
+    /// that error goes to the stream and the engine does not retry it. For
+    /// a multi-topic
+    /// consumer, whether any current topic's is. Lock-free.
+    pub fn is_reconnecting(&self) -> bool {
+        match &self.inner {
+            InnerConsumer::Single(c) => c.is_reconnecting(),
+            InnerConsumer::Multi(c) => c.is_reconnecting(),
         }
     }
 
@@ -2249,6 +2282,9 @@ mod tests {
             0,
             "the old session's redelivery timers are cleared"
         );
+        // FORK-PATCH (3rdi): the reconnect shows on the consumer, and is over
+        assert!(consumer.reconnect_attempts() >= 1);
+        assert!(!consumer.is_reconnecting());
 
         producer
             .send_non_blocking(b"end".to_vec())

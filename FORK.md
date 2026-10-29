@@ -209,6 +209,20 @@ messages can raise it on purpose.
   `dial_detached` (`Err(_) if gave_up => return`) has no test: it needs a
   dial that panics after it already gave up, which the dial-panic and
   give-up test seams do not combine.
+- **A consumer's reconnects are visible** (FORK-PATCH, additive API:
+  `Consumer::reconnect_attempts()` and `Consumer::is_reconnecting()`, also
+  on `TopicConsumer`): since `v6.9.1-3rdi.11` a transient reconnect
+  failure is retried inside the engine and never reaches the stream, so an
+  application could not see that its consumer was reconnecting. The
+  engine now counts every reconnect (resubscribe) attempt it starts and
+  holds "reconnecting" from the start of one until one succeeds or the
+  engine ends; both are atomics read lock-free, and nothing else changes.
+  The count only goes up: a seek (which rebuilds the consumer) and a
+  multi-topic consumer dropping a topic keep the attempts already counted;
+  "reconnecting" is any over a multi-topic consumer's current topics. The
+  flag stays set (frozen) if the engine panics or returns `Ok(())`, and
+  after a failed reconnect on a broker-initiated close, which is not
+  retried (its error goes to the stream).
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

@@ -42,6 +42,8 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
     pub(super) last_message_received: Option<DateTime<Utc>>,
     pub(super) messages_received: u64,
+    /// FORK-PATCH (3rdi): the engine's reconnect signal.
+    reconnect_signal: Arc<super::engine::ReconnectSignal>,
     /// How many forced resubscribes the engine has scheduled.
     #[cfg(test)]
     pub(crate) forced_resubscribes: Arc<AtomicU64>,
@@ -54,6 +56,49 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
+    /// FORK-PATCH (3rdi): how many reconnects (resubscribes) the engine has
+    /// started.
+    pub fn reconnect_attempts(&self) -> u64 {
+        self.reconnect_signal.attempts()
+    }
+
+    /// FORK-PATCH (3rdi): whether the engine is between the start of a
+    /// reconnect and its success.
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnect_signal.is_reconnecting()
+    }
+
+    /// FORK-PATCH (3rdi): adds the attempts of the consumer this one
+    /// replaces.
+    pub(crate) fn carry_reconnect_attempts(&self, attempts: u64) {
+        self.reconnect_signal.carry(attempts);
+    }
+
+    /// A consumer with no engine behind it, its reconnect signal at
+    /// `attempts` (multi-topic bookkeeping tests).
+    #[cfg(test)]
+    pub(crate) fn detached(topic: &str, attempts: u64) -> Self {
+        let (_tx, rx) = super::queue::receive_queue(1, 1024);
+        let (engine_tx, _engine_rx) = mpsc::unbounded();
+        let reconnect_signal = Arc::new(super::engine::ReconnectSignal::default());
+        reconnect_signal.carry(attempts);
+        TopicConsumer {
+            consumer_id: 0,
+            config: Default::default(),
+            topic: topic.to_string(),
+            messages: Box::pin(rx),
+            engine_tx,
+            data_type: PhantomData,
+            dead_letter_policy: None,
+            last_message_received: None,
+            messages_received: 0,
+            reconnect_signal,
+            forced_resubscribes: Default::default(),
+            reconnect_failures: Default::default(),
+            resubscribed: None,
+        }
+    }
+
     /// The byte budget of this consumer's receive queue.
     #[cfg(test)]
     pub(crate) fn queue_max_bytes(&self) -> usize {
@@ -142,6 +187,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy.clone(),
             options.clone(),
         );
+        let reconnect_signal = c.reconnect_signal();
         #[cfg(test)]
         let forced_resubscribes = c.forced_resubscribes();
         #[cfg(test)]
@@ -169,6 +215,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
             last_message_received: None,
             messages_received: 0,
+            reconnect_signal,
             #[cfg(test)]
             forced_resubscribes,
             #[cfg(test)]
