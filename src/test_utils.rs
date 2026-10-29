@@ -66,15 +66,29 @@ pub(crate) async fn consumer_stats_when(
 ) -> serde_json::Value {
     let url =
         format!("http://127.0.0.1:8080/admin/v2/persistent/public/default/{topic_name}/stats");
-    let client = reqwest::Client::new();
+    // one stats call never hangs the wait
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut last = serde_json::Value::Null;
+    let mut last_error = None;
     while std::time::Instant::now() < deadline {
         // a stats call that fails (the topic is moving, e.g. after an
-        // unload) counts as not ready yet
+        // unload) counts as not ready yet; the last failure is reported
         let stats: serde_json::Value = match client.get(&url).send().await {
-            Ok(resp) => resp.json().await.unwrap_or_default(),
-            Err(_) => serde_json::Value::Null,
+            Ok(resp) => match resp.json().await {
+                Ok(stats) => stats,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    serde_json::Value::Null
+                }
+            },
+            Err(e) => {
+                last_error = Some(e.to_string());
+                serde_json::Value::Null
+            }
         };
         last = stats["subscriptions"][subscription]["consumers"][0].clone();
         if !last.is_null() && ready(&last) {
@@ -82,7 +96,7 @@ pub(crate) async fn consumer_stats_when(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("consumer stats never became ready: {last}");
+    panic!("consumer stats never became ready: {last} (last stats call error: {last_error:?})");
 }
 
 /// The test broker's version as the admin API reports it: some
