@@ -97,6 +97,12 @@ messages can raise it on purpose.
   answers within it, so an exclusive subscription is released before it is
   taken again.
 
+- **A forced resubscribe that fails for good ends the consumer**
+  (FORK-PATCH in `src/consumer/engine.rs` `engine`): a corrupt-window
+  resubscribe whose reconnect failed permanently (topic gone or
+  terminated, not authorized, ...) was retried on the backoff forever,
+  the consumer silent. It now ends the engine with that error, as a
+  connection retry does; a transient failure is still retried.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

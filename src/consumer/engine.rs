@@ -421,12 +421,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
 
             if self.forced.due.is_some_and(|due| Instant::now() >= due) {
-                // A failed forced resubscribe is retried with the backoff,
-                // never the end of the engine (`reconnect` cleared `due`),
-                // except a connection retry that failed for good.
+                // A failed forced resubscribe is retried with the backoff
+                // (`reconnect` cleared `due`); FORK-PATCH (3rdi): one that
+                // failed for good, whatever it was pending for, ends the
+                // engine instead of retrying every 60 s forever.
                 let pending = self.forced.pending.unwrap_or(Pending::CorruptWindow);
                 if let Err(e) = self.reconnect().await {
-                    if pending == Pending::ConnectionRetry && !reconnect_is_transient(&e) {
+                    if !reconnect_is_transient(&e) {
                         error!("{}: reconnect failed for good: {e}", self.debug_format());
                         return Err(e);
                     }
@@ -1309,6 +1310,113 @@ mod tests {
             "{ended:?}"
         );
         assert_eq!(engine.reconnect_failures.load(Ordering::SeqCst), 2);
+    }
+
+    /// FORK-PATCH (3rdi): a corrupt-window resubscribe that fails for good
+    /// (here the topic is gone) on a live connection ends the engine instead
+    /// of retrying every 60 s forever.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_permanently_failing_corrupt_window_resubscribe_ends_the_engine() {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            connection_manager::OperationRetryOptions,
+            consumer::queue::receive_queue,
+            message::{BaseCommand, Codec, Message},
+            proto::{CommandConnected, CommandPong},
+            Pulsar, TokioExecutor,
+        };
+
+        // a broker that answers Connect and the keepalive Ping, nothing else:
+        // the connection stays live
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: 3,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if msg.command.ping.is_some() {
+                            BaseCommand {
+                                r#type: 19,
+                                pong: Some(CommandPong::default()),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        let reply = Message {
+                            command: reply,
+                            payload: None,
+                        };
+                        if framed.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        engine.forced.due = Some(Instant::now());
+        engine.forced.pending = Some(Pending::CorruptWindow);
+        engine.injected_permanent = true;
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), engine.engine())
+            .await
+            .expect("a permanently failing resubscribe was retried");
+        assert!(
+            engine.connection.is_valid(),
+            "the connection branch ended it"
+        );
+        assert!(
+            matches!(
+                ended,
+                Err(Error::ServiceDiscovery(
+                    crate::error::ServiceDiscoveryError::NotFound
+                ))
+            ),
+            "{ended:?}"
+        );
     }
 
     /// FORK-PATCH (3rdi): a connection that fails while a corrupt-window
