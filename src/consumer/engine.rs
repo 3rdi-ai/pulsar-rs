@@ -224,6 +224,8 @@ enum Pending {
     ConnectionRetry,
     /// A non-positive batch count corrupted the broker's permit window.
     CorruptWindow,
+    /// The broker closed the consumer and the reconnect failed.
+    BrokerClose,
 }
 
 impl Pending {
@@ -233,7 +235,13 @@ impl Pending {
             Pending::CorruptWindow => {
                 "a non-positive batch count corrupted the broker's permit window"
             }
+            Pending::BrokerClose => "the broker closed the consumer and the reconnect failed",
         }
+    }
+
+    /// A reconnect retry: the consumer has no subscription until it lands.
+    fn is_retry(self) -> bool {
+        matches!(self, Pending::ConnectionRetry | Pending::BrokerClose)
     }
 }
 
@@ -533,7 +541,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // reconnect off a failed connection; only a pending connection
             // retry (already on the backoff) does. A permanent failure (see
             // `reconnect_is_transient`) ends the engine, as upstream did.
-            if self.forced.pending != Some(Pending::ConnectionRetry)
+            if !self.forced.pending.is_some_and(Pending::is_retry)
                 && connection_failed(&self.connection)
             {
                 if let Err(e) = self.reconnect().await {
@@ -597,9 +605,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = 4294967096, no flow message trigger) [underflow on remaining messages - without the patch]
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = -1124, flow message trigger, ask broker to send =>  batch_size - remaining_messages = 2124) [no underflow on remaining messages - with the patch]
             // ```
-            // FORK-PATCH (3rdi): no flow on a dead connection while its
-            // reconnect waits out the backoff (a send failing there loops).
-            if self.connection.is_valid() && needs_flow(self.batch_size, self.remaining_messages) {
+            // FORK-PATCH (3rdi): no flow on a dead connection, nor while a
+            // reconnect retry waits out the backoff: there is no
+            // subscription to grant permits to (a send failing there loops).
+            if self.connection.is_valid()
+                && !self.forced.pending.is_some_and(Pending::is_retry)
+                && needs_flow(self.batch_size, self.remaining_messages)
+            {
                 let permits = flow_permits(self.batch_size, self.remaining_messages);
                 match self.connection.sender().send_flow(self.id, permits).await {
                     Ok(()) => {}
@@ -889,8 +901,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         self.end_with(e);
                         return Ok(false);
                     }
-                    self.log_retry(&e, Pending::ConnectionRetry);
-                    self.schedule_resubscribe(true, Pending::ConnectionRetry);
+                    self.log_retry(&e, Pending::BrokerClose);
+                    self.schedule_resubscribe(true, Pending::BrokerClose);
                 }
             }
             unexpected => {
@@ -1777,6 +1789,40 @@ mod tests {
         run_until_injected(&mut engine, &mut injected, 3).await;
         assert_eq!(signal.attempts(), 3, "the reconnect was retried");
         assert!(signal.is_reconnecting());
+    }
+
+    /// FORK-PATCH (3rdi): while a reconnect retry waits out its backoff
+    /// the engine sends no flow: there is no subscription to grant permits
+    /// to.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn no_flow_while_a_reconnect_retry_is_pending() {
+        let (mut engine, _messages_tx, _rx, _engine_tx) = engine_on_a_live_connection().await;
+        engine.remaining_messages = 0;
+        engine.forced.due = Some(Instant::now() + Duration::from_secs(3600));
+        engine.forced.pending = Some(Pending::BrokerClose);
+        {
+            let run = engine.engine();
+            futures::pin_mut!(run);
+            assert!(futures::poll!(run.as_mut()).is_pending());
+        }
+        assert_eq!(engine.remaining_messages, 0, "a flow was sent");
+
+        // with no retry pending the same turn sends it
+        engine.forced.pending = Some(Pending::CorruptWindow);
+        {
+            let run = engine.engine();
+            futures::pin_mut!(run);
+            assert!(futures::poll!(run.as_mut()).is_pending());
+        }
+        assert!(
+            engine.remaining_messages > 0,
+            "no flow without a retry pending"
+        );
     }
 
     /// FORK-PATCH (3rdi): a reconnect on a broker-initiated close that
