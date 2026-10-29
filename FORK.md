@@ -87,6 +87,16 @@ messages can raise it on purpose.
   off a failed connection, and each retry logs its own reason
   (prophesee-service-rs #284).
 
+- **A reconnect off a failed connection does not wait out the close**
+  (FORK-PATCH in `src/consumer/engine.rs` `reconnect`): upstream sent
+  CloseConsumer on the dead connection and waited out the whole operation
+  timeout (30 s by default) before looking the topic up again, the slow
+  reattach measured after broker restarts (prophesee-service-rs #284). On a
+  failed connection the close is now best effort, bounded by 1 s
+  (`DEAD_CONNECTION_CLOSE_TIMEOUT`): a broker still behind the socket
+  answers within it, so an exclusive subscription is released before it is
+  taken again.
+
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

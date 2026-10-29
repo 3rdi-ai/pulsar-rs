@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -133,6 +132,11 @@ impl Pending {
         }
     }
 }
+
+/// FORK-PATCH (3rdi): how long a reconnect waits for the broker to answer
+/// the close of the consumer on a failed connection: a broker still behind
+/// the socket answers in milliseconds, one that is gone never does.
+const DEAD_CONNECTION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The first forced-resubscribe delay, and the most it backs off to: the
 /// Java client's reconnection backoff (`initialBackoffInterval` 100 ms,
@@ -499,7 +503,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 due.saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(1))
             });
-            match Self::timeout(self.event_rx.next(), wait).await {
+            // FORK-PATCH (3rdi): on the runtime's own timer (the executor's
+            // delay), the one timer source of the engine
+            let tick = std::pin::pin!(self.client.executor.delay(wait));
+            let event = std::pin::pin!(self.event_rx.next());
+            let next = match futures::future::select(event, tick).await {
+                futures::future::Either::Left((event, _)) => Ok(event),
+                futures::future::Either::Right(_) => Err(()),
+            };
+            match next {
                 Err(_) => {
                     // If you are reading this comment, you may have an issue where you have
                     // received a batched message that is greater that the batch
@@ -1001,7 +1013,27 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
         // stopping the current Message source
-        if let Err(e) = self.connection.sender().close_consumer(self.id).await {
+        // FORK-PATCH (3rdi): on a failed connection the close is best
+        // effort, bounded by DEAD_CONNECTION_CLOSE_TIMEOUT. Upstream waited
+        // out the whole operation timeout (30 s by default) for an answer a
+        // broker that is gone never sends; a broker still behind the socket
+        // answers within the bound, so an exclusive subscription is still
+        // released before it is taken again.
+        let close = self.connection.sender().close_consumer(self.id);
+        let closed = if self.connection.is_valid() {
+            close.await
+        } else {
+            // the runtime's own timer, as every other timeout here
+            let cap = self.client.executor.delay(DEAD_CONNECTION_CLOSE_TIMEOUT);
+            match futures::future::select(Box::pin(close), Box::pin(cap)).await {
+                futures::future::Either::Left((closed, _)) => closed,
+                futures::future::Either::Right(_) => Err(ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no answer to the close on a failed connection",
+                ))),
+            }
+        };
+        if let Err(e) = closed {
             error!(
                 "could not close consumer {:?}({}) for topic {}: {:?}",
                 self.name, self.id, self.topic, e
@@ -1068,23 +1100,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 .unwrap_or_default(),
             topic = self.topic
         )
-    }
-
-    #[cfg(feature = "async-std")]
-    async fn timeout<F: Future<Output = O>, O>(
-        fut: F,
-        dur: Duration,
-    ) -> Result<O, async_std::future::TimeoutError> {
-        use async_std::prelude::FutureExt;
-        fut.timeout(dur).await
-    }
-
-    #[cfg(all(not(feature = "async-std"), feature = "tokio"))]
-    async fn timeout<F: Future<Output = O>, O>(
-        fut: F,
-        dur: Duration,
-    ) -> Result<O, tokio::time::error::Elapsed> {
-        tokio::time::timeout_at(tokio::time::Instant::now() + dur, fut).await
     }
 }
 
@@ -1311,6 +1326,189 @@ mod tests {
         engine.forced.pending = Some(Pending::CorruptWindow);
         engine.reconnect_failures.store(1, Ordering::SeqCst);
         run_until_injected(&mut engine, &mut injected, 1).await;
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect off a failed connection still sends
+    /// CloseConsumer, but does not wait out the operation timeout for an
+    /// answer a broker that is gone never sends (upstream did: 30 s by
+    /// default before the consumer could look its topic up again).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_reconnect_off_a_failed_connection_does_not_wait_out_the_close() {
+        use crate::{
+            connection_manager::{tests::silent_broker, OperationRetryOptions},
+            consumer::queue::receive_queue,
+            Pulsar, TokioExecutor,
+        };
+
+        let (url, mut seen) = silent_broker::listen().await;
+        let client = Pulsar::builder(url, TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        conn.fail_for_test();
+
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        // stop the reconnect right after the close, before the lookup
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        let reconnected = tokio::time::timeout(Duration::from_secs(10), engine.reconnect())
+            .await
+            .expect("the reconnect waited out the close's operation timeout");
+        assert!(reconnected.is_err());
+
+        let mut closed = false;
+        while let Ok(cmd) = seen.try_recv() {
+            closed |= cmd.close_consumer.is_some();
+        }
+        assert!(closed, "the best-effort close was sent");
+    }
+
+    /// FORK-PATCH (3rdi): on a live connection the close still waits for
+    /// the broker's answer, however slow (up to the operation timeout); only
+    /// a failed connection caps it.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_reconnect_off_a_live_connection_waits_for_the_close() {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            connection_manager::OperationRetryOptions,
+            consumer::queue::receive_queue,
+            message::{BaseCommand, Codec, Message},
+            proto::{CommandConnected, CommandSuccess},
+            Pulsar, TokioExecutor,
+        };
+
+        // a broker that holds its answer to CloseConsumer until the test
+        // releases it
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: 3,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if let Some(close) = msg.command.close_consumer {
+                            let held = release.lock().unwrap().take();
+                            if let Some(held) = held {
+                                let _ = held.await;
+                            }
+                            BaseCommand {
+                                r#type: 13,
+                                success: Some(CommandSuccess {
+                                    request_id: close.request_id,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        let reply = Message {
+                            command: reply,
+                            payload: None,
+                        };
+                        if framed.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        assert!(conn.is_valid());
+
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        // stop the reconnect right after the close, before the lookup
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+
+        // virtual time from here: past the failed-connection cap, the
+        // reconnect still waits for the live connection's answer
+        tokio::time::pause();
+        let reconnect = engine.reconnect();
+        futures::pin_mut!(reconnect);
+        assert!(futures::poll!(reconnect.as_mut()).is_pending());
+        tokio::time::advance(DEAD_CONNECTION_CLOSE_TIMEOUT * 2).await;
+        assert!(
+            futures::poll!(reconnect.as_mut()).is_pending(),
+            "the reconnect did not wait for the live connection's close"
+        );
+
+        // the broker answers: the reconnect goes on (and stops at the
+        // injected failure)
+        tokio::time::resume();
+        release_tx.send(()).unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(10), reconnect)
+            .await
+            .expect("the reconnect did not complete after the answer");
+        assert!(done.is_err());
     }
 
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
