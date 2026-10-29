@@ -316,7 +316,7 @@ pub(crate) fn decompress(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "flate2")]
+    #[cfg(any(feature = "flate2", feature = "snap"))]
     use std::io::Write;
 
     use super::*;
@@ -325,7 +325,12 @@ mod tests {
     const MEMBERS: u32 = DEFAULT_MAX_BATCH_MEMBERS;
     const ENVELOPE: usize = DEFAULT_MAX_BATCH_ENVELOPE_BYTES;
 
-    #[cfg(any(feature = "zstd", feature = "flate2", feature = "lz4"))]
+    #[cfg(any(
+        feature = "zstd",
+        feature = "flate2",
+        feature = "lz4",
+        feature = "snap"
+    ))]
     fn bomb() -> Vec<u8> {
         vec![0u8; LIMIT * 8]
     }
