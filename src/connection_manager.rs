@@ -83,7 +83,9 @@ impl OperationRetryOptions {
 
 /// FORK-PATCH (3rdi): a copy of a dial's failure for each caller waiting on
 /// it (`ConnectionError` is not `Clone`): the same variant, and an I/O error
-/// of the same kind, so retry classification matches the dialer's.
+/// of the same kind, so retry classification matches the dialer's. An I/O
+/// error keeps its kind and message but loses its `source()` chain, and a
+/// TLS or DNS-name error becomes `Unexpected` with its message.
 fn for_waiter(e: &ConnectionError) -> ConnectionError {
     match e {
         ConnectionError::Io(e) => ConnectionError::Io(std::io::Error::new(e.kind(), e.to_string())),
@@ -200,6 +202,7 @@ pub(crate) mod tests {
                 tls_options: TlsOptions::default(),
                 certificate_chain: vec![],
                 outbound_channel_size: 100,
+                dial_panics: false,
             }
         }
 
@@ -282,6 +285,74 @@ pub(crate) mod tests {
         let second =
             tokio::time::timeout(Duration::from_secs(3600), manager.get_connection(&broker)).await;
         assert!(second.is_ok(), "a cancelled dial stranded the next caller");
+    }
+
+    /// A broker that accepts the socket and never answers CommandConnect;
+    /// its `pulsar://` URL.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn mute_broker() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        format!("pulsar://127.0.0.1:{port}")
+    }
+
+    /// FORK-PATCH (3rdi): a dial that panics fails its waiters with
+    /// `Unexpected` and clears the entry, so the next caller dials anew.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_panicking_dial_fails_its_waiters_and_clears_the_entry() {
+        let mut manager = silent_broker::undialed_manager(&mute_broker().await);
+        manager.dial_panics = true;
+        let broker = manager.get_base_address();
+        let got = tokio::time::timeout(Duration::from_secs(10), manager.get_connection(&broker))
+            .await
+            .expect("the waiter of a panicked dial was stranded");
+        assert!(
+            matches!(got, Err(ConnectionError::Unexpected(_))),
+            "{:?}",
+            got.map(|c| c.id())
+        );
+        assert!(manager.connections.lock().await.get(&broker).is_none());
+    }
+
+    /// FORK-PATCH (3rdi): a detached dial that every caller stopped waiting
+    /// for gives up at its next retry and clears the entry.
+    #[tokio::test(start_paused = true)]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_dial_nobody_waits_for_gives_up() {
+        let mut manager = silent_broker::undialed_manager(&mute_broker().await);
+        manager.connection_retry_options.max_retries = 1000;
+        let broker = manager.get_base_address();
+        {
+            let first = manager.get_connection(&broker);
+            futures::pin_mut!(first);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+        } // the only caller is dropped
+
+        // virtual time: one connection timeout and a backoff go by
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(
+            manager.connections.lock().await.get(&broker).is_none(),
+            "the dial kept retrying for nobody"
+        );
     }
 
     /// FORK-PATCH (3rdi): once a connection failed, the pool hands out a
@@ -403,6 +474,9 @@ pub struct ConnectionManager<Exe: Executor> {
     pub(crate) tls_options: TlsOptions,
     certificate_chain: Vec<Certificate>,
     outbound_channel_size: usize,
+    /// Test seam: the dial panics.
+    #[cfg(test)]
+    dial_panics: bool,
 }
 
 impl<Exe: Executor> ConnectionManager<Exe> {
@@ -471,6 +545,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             tls_options,
             certificate_chain,
             outbound_channel_size,
+            #[cfg(test)]
+            dial_panics: false,
         };
         let broker_address = BrokerAddress {
             url: url.clone(),
@@ -574,6 +650,15 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
+    /// Whether every caller queued on `broker`'s `Connecting` entry stopped
+    /// waiting (its future was dropped).
+    async fn nobody_waits(&self, broker: &BrokerAddress) -> bool {
+        match self.connections.lock().await.get(broker) {
+            Some(ConnectionStatus::Connecting(v)) => v.iter().all(|tx| tx.is_canceled()),
+            _ => false,
+        }
+    }
+
     /// FORK-PATCH (3rdi): dials `broker` for the callers queued on its
     /// `Connecting` entry, detached from all of them. Whatever ends the
     /// dial (an error, a panic, a failed keepalive spawn) resolves every
@@ -637,6 +722,11 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             };
         }
 
+        #[cfg(test)]
+        if self.dial_panics {
+            panic!("injected dial panic");
+        }
+
         let proxy_url = if broker.proxy {
             Some(broker.broker_url.clone())
         } else {
@@ -688,6 +778,12 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         current_backoff.as_millis()
                     );
                     self.executor.delay(current_backoff).await;
+                    // FORK-PATCH (3rdi): a detached dial that every caller
+                    // stopped waiting for gives up instead of retrying on.
+                    if claimed && self.nobody_waits(broker).await {
+                        debug!("nobody waits for the dial to {} any more", broker.url);
+                        return Err(ConnectionError::Canceled);
+                    }
                 }
                 Err(e) => {
                     return Err(e);

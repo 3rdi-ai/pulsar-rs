@@ -66,14 +66,10 @@ messages can raise it on purpose.
   a detached task that every caller, the claimer included, waits on, so
   cancelling any caller (an application timeout, an aborted task, a lost
   `select!`) strands no one; an error, a panic or a failed spawn resolves
-  every waiter and clears the entry. Waiters get a copy of the dial's own
+  every waiter and clears the entry, and a dial every caller stopped
+  waiting for gives up at its next retry. Waiters get a copy of the dial's own
   error (same variant, same I/O kind) instead of upstream's `Canceled`, so
   they classify the retry the same way.
-- **A timed-out request forgets its resolver** (FORK-PATCH in
-  `src/connection.rs`): now that a timeout no longer retires the
-  connection, the timed-out request's resolver is removed
-  (`Register::CancelRequest`), and a late reply to a request nobody waits
-  for is dropped instead of being kept for the connection's lifetime.
 
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its

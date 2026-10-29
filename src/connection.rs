@@ -56,10 +56,6 @@ pub(crate) enum Register {
     Ping {
         resolver: oneshot::Sender<()>,
     },
-    /// FORK-PATCH (3rdi): the request timed out, forget its resolver
-    CancelRequest {
-        key: RequestKey,
-    },
 }
 
 /// identifier for a message
@@ -194,9 +190,6 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                 Poll::Ready(Some(Register::Ping { resolver })) => {
                     self.ping = Some(resolver);
                 }
-                Poll::Ready(Some(Register::CancelRequest { key })) => {
-                    self.pending_requests.remove(&key);
-                }
                 Poll::Ready(None) => {
                     self.error.set(ConnectionError::Disconnected);
                     return Poll::Ready(Err(()));
@@ -233,13 +226,6 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                                 if let Some(resolver) = self.pending_requests.remove(&key) {
                                     // We don't care if the receiver has dropped their future
                                     let _ = resolver.send(msg);
-                                } else if matches!(key, RequestKey::RequestId(_)) {
-                                    // FORK-PATCH (3rdi): a request registers before
-                                    // it is written and registrations are drained
-                                    // before replies, so an unmatched reply is to
-                                    // a request that timed out: drop it (upstream
-                                    // kept it for the connection's lifetime).
-                                    debug!("dropping a reply nobody waits for: {:?}", key);
                                 } else {
                                     self.received_messages.insert(key, msg);
                                 }
@@ -762,7 +748,6 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         trace!("sending message(key = {:?}): {:?}", key, msg);
 
         let k = key.clone();
-        let cancel_key = key.clone();
         let error = self.error.clone();
         let response = async move {
             response
@@ -825,7 +810,6 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         };
 
         let connection_id = self.connection_id;
-        let registrations = self.registrations.clone();
         let delay_f = self.executor.delay(self.operation_timeout);
         trace!(
             "Create timeout futures with operation timeout at {:?}",
@@ -848,10 +832,6 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                     // only. Upstream also set the connection-wide error here,
                     // retiring the connection for every user of it; as in
                     // the Java client, only a failed keepalive ping does.
-                    // Its resolver goes, so it does not wait for the
-                    // connection's lifetime.
-                    let _ =
-                        registrations.unbounded_send(Register::CancelRequest { key: cancel_key });
                     Err(ConnectionError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -2259,47 +2239,6 @@ mod tests {
             }
             _ => panic!("Unexpected message"),
         };
-    }
-
-    /// FORK-PATCH (3rdi): a reply to a request nobody waits for (its
-    /// request timed out and was cancelled) is dropped, not kept for the
-    /// connection's lifetime.
-    #[tokio::test]
-    async fn an_unmatched_request_reply_is_dropped() {
-        let (message_tx, message_rx) = mpsc::unbounded();
-        let (control_tx, _control_rx) = async_channel::unbounded();
-        let (_registrations_tx, registrations_rx) = mpsc::unbounded();
-        let (_receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
-        let (auth_challenge_tx, _auth_challenge_rx) = mpsc::unbounded();
-        let mut receiver = Receiver::new(
-            message_rx,
-            control_tx,
-            SharedError::new(),
-            registrations_rx,
-            receiver_shutdown_rx,
-            auth_challenge_tx,
-            Default::default(),
-        );
-
-        // a late lookup reply, request id 7
-        message_tx
-            .unbounded_send(Ok(Message {
-                command: BaseCommand {
-                    r#type: 24,
-                    lookup_topic_response: Some(crate::proto::CommandLookupTopicResponse {
-                        request_id: 7,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                payload: None,
-            }))
-            .unwrap();
-        assert!(futures::poll!(&mut receiver).is_pending());
-        assert!(
-            receiver.received_messages.is_empty(),
-            "the unmatched reply was kept"
-        );
     }
 
     /// FORK-PATCH (3rdi): a connection whose keepalive ping failed is dead for
