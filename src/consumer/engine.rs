@@ -93,12 +93,27 @@ fn reconnect_is_transient(e: &Error) -> bool {
     }
     fn connection(e: &ConnectionError) -> bool {
         match e {
-            // a TLS failure (bad certificate data, permission denied) is
-            // not going away on a retry
-            ConnectionError::Io(e) => !matches!(
-                e.kind(),
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
-            ),
+            // FORK-PATCH (3rdi): a TLS failure is classified by the rustls
+            // error it carries; without one, bad data or a denied
+            // permission is not going away on a retry
+            ConnectionError::Io(e) => {
+                crate::error::tls_failure_is_transient(e).unwrap_or_else(|| {
+                    !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
+                    )
+                })
+            }
+            #[cfg(all(
+                any(
+                    feature = "tokio-rustls-runtime-aws-lc-rs",
+                    feature = "tokio-rustls-runtime-ring",
+                    feature = "async-std-rustls-runtime-aws-lc-rs",
+                    feature = "async-std-rustls-runtime-ring"
+                ),
+                not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+            ))]
+            ConnectionError::Tls(e) => crate::error::rustls_error_is_transient(e),
             ConnectionError::Disconnected | ConnectionError::Canceled => true,
             ConnectionError::PulsarError(code, _) => server(code),
             e => e.establish_retryable(),
@@ -1247,6 +1262,57 @@ mod tests {
         .expect("the injected reconnect failures did not fire");
         if let futures::future::Either::Left((res, _)) = ran {
             panic!("the engine ended on a failed reconnect: {res:?}");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): a TLS failure is classified by its rustls error,
+    /// also once a dial's waiters got their copy of it.
+    #[test]
+    #[cfg(any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    fn tls_failures_are_classified_by_their_rustls_error() {
+        use rustls::{AlertDescription, CertificateError, Error as Tls, InvalidMessage};
+        let tls =
+            |e: Tls| ConnectionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        let cases = [
+            (
+                tls(Tls::InvalidMessage(InvalidMessage::InvalidContentType)),
+                true,
+            ),
+            (
+                tls(Tls::AlertReceived(AlertDescription::InternalError)),
+                true,
+            ),
+            (
+                tls(Tls::AlertReceived(AlertDescription::BadCertificate)),
+                false,
+            ),
+            (
+                tls(Tls::InvalidCertificate(CertificateError::BadSignature)),
+                false,
+            ),
+            (
+                tls(Tls::InvalidCertificate(CertificateError::Expired)),
+                false,
+            ),
+            (tls(Tls::NoCertificatesPresented), false),
+        ];
+        for (err, transient) in cases {
+            let copy = crate::connection_manager::for_waiter(&err);
+            assert_eq!(
+                reconnect_is_transient(&Error::Connection(err)),
+                transient,
+                "the dialer's error"
+            );
+            assert_eq!(
+                reconnect_is_transient(&Error::Connection(copy)),
+                transient,
+                "a waiter's copy"
+            );
         }
     }
 

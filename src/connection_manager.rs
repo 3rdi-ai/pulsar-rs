@@ -81,14 +81,33 @@ impl OperationRetryOptions {
     }
 }
 
+/// An I/O error's kind and message; a rustls error inside it is kept (it
+/// is `Clone`), so a TLS failure classifies the same for every waiter.
+fn copy_io_error(e: &std::io::Error) -> std::io::Error {
+    #[cfg(any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    if let Some(tls) = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        return std::io::Error::new(e.kind(), tls.clone());
+    }
+    std::io::Error::new(e.kind(), e.to_string())
+}
+
 /// FORK-PATCH (3rdi): a copy of a dial's failure for each caller waiting on
 /// it (`ConnectionError` is not `Clone`): the same variant, and an I/O error
 /// of the same kind, so retry classification matches the dialer's. An I/O
-/// error keeps its kind and message but loses its `source()` chain, and a
-/// TLS or DNS-name error becomes `Unexpected` with its message.
-fn for_waiter(e: &ConnectionError) -> ConnectionError {
+/// error keeps its kind and message, and a rustls error inside it, but
+/// loses any other `source()` chain; a TLS or DNS-name error variant becomes
+/// `Unexpected` with its message.
+pub(crate) fn for_waiter(e: &ConnectionError) -> ConnectionError {
     match e {
-        ConnectionError::Io(e) => ConnectionError::Io(std::io::Error::new(e.kind(), e.to_string())),
+        ConnectionError::Io(e) => ConnectionError::Io(copy_io_error(e)),
         ConnectionError::SlowDown => ConnectionError::SlowDown,
         ConnectionError::Disconnected => ConnectionError::Disconnected,
         ConnectionError::PulsarError(code, msg) => ConnectionError::PulsarError(*code, msg.clone()),

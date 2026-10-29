@@ -175,6 +175,23 @@ messages can raise it on purpose.
   owns. The check runs after each backoff, so an abandoned dial still makes
   the one full `Connection::new` attempt it is in (up to the connection
   timeout) and its backoff before it gives up.
+- **A TLS failure is classified by its rustls error** (FORK-PATCH in
+  `src/error.rs` `tls_failure_is_transient`): on the rustls runtimes a
+  consumer reconnect that failed with a rustls error is classified by it.
+  `InvalidMessage(InvalidContentType)` is **permanent**: it is what a
+  client gets from a plaintext port, a misconfiguration that should fail
+  fast. Any other `InvalidMessage` and an `AlertReceived(InternalError)`
+  are **transient**: a broker shutting down mid-handshake produces them.
+  But a Java broker also sends `InternalError` for a keystore or cipher
+  misconfiguration, which never heals, so once the same TLS-transient
+  failure has repeated 5 times in a row on one engine its retries log at
+  `error!` instead of `warn!` (the count resets on a successful
+  reconnect). Certificate, authorization and other protocol failures are
+  permanent. Without a rustls error inside, an I/O error of kind
+  InvalidData or PermissionDenied stays permanent as before. A dial's
+  waiters keep the rustls error in their copy (`copy_io_error`), so they
+  classify it the same way. Only the consumer engine's reconnect uses
+  this classification; producers do not.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

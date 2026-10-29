@@ -132,6 +132,46 @@ impl ConnectionError {
     }
 }
 
+/// FORK-PATCH (3rdi): whether a rustls failure is worth a retry: a broker
+/// that briefly misbehaved (a malformed record, an internal-error alert)
+/// may recover; a certificate, authorization or protocol-policy failure
+/// will not. `None` when `e` carries no rustls error.
+#[cfg(any(
+    feature = "tokio-rustls-runtime-aws-lc-rs",
+    feature = "tokio-rustls-runtime-ring",
+    feature = "async-std-rustls-runtime-aws-lc-rs",
+    feature = "async-std-rustls-runtime-ring"
+))]
+pub(crate) fn tls_failure_is_transient(e: &io::Error) -> Option<bool> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .map(rustls_error_is_transient)
+}
+
+#[cfg(not(any(
+    feature = "tokio-rustls-runtime-aws-lc-rs",
+    feature = "tokio-rustls-runtime-ring",
+    feature = "async-std-rustls-runtime-aws-lc-rs",
+    feature = "async-std-rustls-runtime-ring"
+)))]
+pub(crate) fn tls_failure_is_transient(_e: &io::Error) -> Option<bool> {
+    None
+}
+
+#[cfg(any(
+    feature = "tokio-rustls-runtime-aws-lc-rs",
+    feature = "tokio-rustls-runtime-ring",
+    feature = "async-std-rustls-runtime-aws-lc-rs",
+    feature = "async-std-rustls-runtime-ring"
+))]
+pub(crate) fn rustls_error_is_transient(e: &rustls::Error) -> bool {
+    matches!(
+        e,
+        rustls::Error::InvalidMessage(_)
+            | rustls::Error::AlertReceived(rustls::AlertDescription::InternalError)
+    )
+}
+
 impl From<io::Error> for ConnectionError {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn from(err: io::Error) -> Self {
