@@ -1016,14 +1016,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let closed = if self.connection.is_valid() {
             close.await
         } else {
-            Self::timeout(close, DEAD_CONNECTION_CLOSE_TIMEOUT)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ConnectionError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "no answer to the close on a failed connection",
-                    )))
-                })
+            // the runtime's own timer, as every other timeout here
+            let cap = self.client.executor.delay(DEAD_CONNECTION_CLOSE_TIMEOUT);
+            match futures::future::select(Box::pin(close), Box::pin(cap)).await {
+                futures::future::Either::Left((closed, _)) => closed,
+                futures::future::Either::Right(_) => Err(ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no answer to the close on a failed connection",
+                ))),
+            }
         };
         if let Err(e) = closed {
             error!(
@@ -1409,8 +1410,6 @@ mod tests {
         feature = "tokio-rustls-runtime-ring"
     ))]
     async fn a_reconnect_off_a_live_connection_waits_for_the_close() {
-        use std::sync::atomic::AtomicBool;
-
         use futures::SinkExt;
         use tokio::net::TcpListener;
 
@@ -1422,15 +1421,15 @@ mod tests {
             Pulsar, TokioExecutor,
         };
 
-        // a broker that answers CloseConsumer after 3 s, slower than the
-        // cap on a failed connection
-        let answered = Arc::new(AtomicBool::new(false));
+        // a broker that holds its answer to CloseConsumer until the test
+        // releases it
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let flag = Arc::clone(&answered);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let flag = Arc::clone(&flag);
+                let release = Arc::clone(&release);
                 tokio::spawn(async move {
                     let mut framed = tokio_util::codec::Framed::new(stream, Codec);
                     while let Some(Ok(msg)) = framed.next().await {
@@ -1441,8 +1440,10 @@ mod tests {
                                 ..Default::default()
                             }
                         } else if let Some(close) = msg.command.close_consumer {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            flag.store(true, Ordering::SeqCst);
+                            let held = release.lock().unwrap().take();
+                            if let Some(held) = held {
+                                let _ = held.await;
+                            }
                             BaseCommand {
                                 r#type: 13,
                                 success: Some(CommandSuccess {
@@ -1497,11 +1498,27 @@ mod tests {
         );
         // stop the reconnect right after the close, before the lookup
         engine.reconnect_failures.store(1, Ordering::SeqCst);
-        assert!(engine.reconnect().await.is_err());
+
+        // virtual time from here: past the failed-connection cap, the
+        // reconnect still waits for the live connection's answer
+        tokio::time::pause();
+        let reconnect = engine.reconnect();
+        futures::pin_mut!(reconnect);
+        assert!(futures::poll!(reconnect.as_mut()).is_pending());
+        tokio::time::advance(DEAD_CONNECTION_CLOSE_TIMEOUT * 2).await;
         assert!(
-            answered.load(Ordering::SeqCst),
+            futures::poll!(reconnect.as_mut()).is_pending(),
             "the reconnect did not wait for the live connection's close"
         );
+
+        // the broker answers: the reconnect goes on (and stops at the
+        // injected failure)
+        tokio::time::resume();
+        release_tx.send(()).unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(10), reconnect)
+            .await
+            .expect("the reconnect did not complete after the answer");
+        assert!(done.is_err());
     }
 
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
