@@ -1957,7 +1957,9 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let corrupts = count <= 0 && matches!(sub_type, SubType::Exclusive | SubType::Failover);
+        // Shared skips the entry; every other type is recovered by one
+        // forced resubscribe from a non-positive count
+        let corrupts = count <= 0 && sub_type != SubType::Shared;
         match &consumer.inner {
             InnerConsumer::Single(c) => c
                 .reconnect_failures
@@ -2071,15 +2073,43 @@ mod tests {
         ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::Exclusive, 2).await;
     }
 
-    /// Key_Shared behaves as Shared against a 5.0.0 broker: an entry
-    /// declaring a non-positive count is never delivered, and nor is an
-    /// ordinary message published after it (the dispatcher stalls). The
-    /// client never sees the entry, so it cannot recover the subscription
-    /// and schedules no resubscribe; the publisher trust boundary is the
-    /// defence (FORK.md). A broker that starts delivering it fails this
-    /// test, which is the cue to include Key_Shared in the recovery.
+    /// FORK-PATCH (3rdi): an entry declaring a non-positive count on
+    /// Key_Shared, asserted per MEASURED broker version (FORK.md matrix).
+    /// - 4.0.5 and 4.0.8 (the broker Scania runs: Helm chart 4.4.0 ships
+    ///   4.0.8) deliver it and debit the count, which wraps the permit
+    ///   window and stalls dispatch; the client refuses the entry and
+    ///   recovers with one forced resubscribe, as on Exclusive/Failover.
+    /// - 3.3.0 and 5.0.0 never deliver it, nor anything published after it
+    ///   (the dispatcher stalls): the client never sees the entry, so it
+    ///   cannot recover and schedules no resubscribe; the publisher trust
+    ///   boundary is the defence (FORK.md).
+    /// - Any other version is unmeasured: an explicit, logged skip.
     #[tokio::test]
-    async fn a_non_positive_count_on_key_shared_is_never_delivered() {
+    async fn a_non_positive_count_on_key_shared_per_broker_version() {
+        let reported = crate::test_utils::broker_version().await;
+        let version = crate::test_utils::release_version(&reported);
+        match version {
+            Some((4, 0, 5)) | Some((4, 0, 8)) => {
+                eprintln!(
+                    "broker {version:?}: Key_Shared delivers the entry; asserting the recovery"
+                );
+                ordinary_messages_flow_after_a_declared_count(i32::MIN, SubType::KeyShared, 0)
+                    .await;
+                ordinary_messages_flow_after_a_declared_count(-1, SubType::KeyShared, 0).await;
+                return;
+            }
+            Some((3, 3, 0)) | Some((5, 0, 0)) => {
+                eprintln!(
+                    "broker {version:?}: Key_Shared never delivers the entry; asserting the stall"
+                );
+            }
+            _ => {
+                eprintln!(
+                    "SKIPPED: unmeasured broker version {reported:?} for the Key_Shared forged-count test; measure it and add it to the FORK.md matrix"
+                );
+                return;
+            }
+        }
         let topic = format!("key_shared_declared_{}", rand::random::<u32>());
         let client = crate::test_utils::new_pulsar().await;
         let mut producer = client.producer().with_topic(&topic).build().await.unwrap();

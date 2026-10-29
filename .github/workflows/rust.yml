@@ -39,7 +39,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pulsar-version: [2.11.4, 3.0.8, 3.2.4, 3.3.3, 4.0.1, 4.1.2]
+        # 3rdi fork: 4.0.8 is the broker Scania runs (Helm chart 4.4.0) and
+        # one the Key_Shared forged-count test asserts on (FORK.md matrix)
+        pulsar-version: [2.11.4, 3.0.8, 3.2.4, 3.3.3, 4.0.1, 4.0.8, 4.1.2]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
