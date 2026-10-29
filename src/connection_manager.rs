@@ -81,9 +81,277 @@ impl OperationRetryOptions {
     }
 }
 
+/// FORK-PATCH (3rdi): a copy of a dial's failure for each caller waiting on
+/// it (`ConnectionError` is not `Clone`): the same variant, and an I/O error
+/// of the same kind, so retry classification matches the dialer's. An I/O
+/// error keeps its kind and message but loses its `source()` chain, and a
+/// TLS or DNS-name error becomes `Unexpected` with its message.
+fn for_waiter(e: &ConnectionError) -> ConnectionError {
+    match e {
+        ConnectionError::Io(e) => ConnectionError::Io(std::io::Error::new(e.kind(), e.to_string())),
+        ConnectionError::SlowDown => ConnectionError::SlowDown,
+        ConnectionError::Disconnected => ConnectionError::Disconnected,
+        ConnectionError::PulsarError(code, msg) => ConnectionError::PulsarError(*code, msg.clone()),
+        ConnectionError::Unexpected(m) => ConnectionError::Unexpected(m.clone()),
+        ConnectionError::Decoding(m) => ConnectionError::Decoding(m.clone()),
+        ConnectionError::Encoding(m) => ConnectionError::Encoding(m.clone()),
+        ConnectionError::SocketAddr(m) => ConnectionError::SocketAddr(m.clone()),
+        ConnectionError::UnexpectedResponse(m) => ConnectionError::UnexpectedResponse(m.clone()),
+        ConnectionError::Authentication(a) => ConnectionError::Authentication(a.clone()),
+        ConnectionError::NotFound => ConnectionError::NotFound,
+        ConnectionError::Canceled => ConnectionError::Canceled,
+        ConnectionError::Shutdown => ConnectionError::Shutdown,
+        other => ConnectionError::Unexpected(other.to_string()),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A fake broker for connection-pool tests: it answers every
+    /// `CommandConnect` with `CommandConnected` and never answers anything
+    /// else, so any request on its connections times out.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    pub(crate) mod silent_broker {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        use super::*;
+        use crate::{
+            message::{BaseCommand, Codec, Message},
+            proto::CommandConnected,
+            TokioExecutor,
+        };
+
+        /// A silent broker's `pulsar://` URL, and every command it receives.
+        pub(crate) async fn listen() -> (
+            String,
+            futures::channel::mpsc::UnboundedReceiver<BaseCommand>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (seen_tx, seen_rx) = futures::channel::mpsc::unbounded();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen_tx = seen_tx.clone();
+                    tokio::spawn(async move {
+                        let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                        while let Some(Ok(msg)) = framed.next().await {
+                            let _ = seen_tx.unbounded_send(msg.command.clone());
+                            if msg.command.connect.is_some() {
+                                let connected = Message {
+                                    command: BaseCommand {
+                                        r#type: 3,
+                                        connected: Some(CommandConnected::default()),
+                                        ..Default::default()
+                                    },
+                                    payload: None,
+                                };
+                                if framed.send(connected).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            (format!("pulsar://127.0.0.1:{port}"), seen_rx)
+        }
+
+        /// A manager on a silent broker with a 200 ms operation timeout,
+        /// and the broker's address.
+        pub(crate) async fn manager() -> (ConnectionManager<TokioExecutor>, BrokerAddress) {
+            let (url, _) = listen().await;
+            let manager = ConnectionManager::new(
+                url,
+                None,
+                None,
+                OperationRetryOptions {
+                    operation_timeout: Duration::from_millis(200),
+                    ..Default::default()
+                },
+                None,
+                100,
+                Arc::new(TokioExecutor),
+            )
+            .await
+            .unwrap();
+            let broker = manager.get_base_address();
+            (manager, broker)
+        }
+
+        /// A manager on `url` that has not dialed yet (no broker answers
+        /// there): one connection attempt, a 1 s connection timeout.
+        pub(crate) fn undialed_manager(url: &str) -> ConnectionManager<TokioExecutor> {
+            ConnectionManager {
+                url: Url::parse(url).unwrap(),
+                auth: None,
+                executor: Arc::new(TokioExecutor),
+                connections: Arc::new(Mutex::new(HashMap::new())),
+                connection_retry_options: ConnectionRetryOptions {
+                    max_retries: 0,
+                    connection_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+                operation_retry_options: OperationRetryOptions::default(),
+                tls_options: TlsOptions::default(),
+                certificate_chain: vec![],
+                outbound_channel_size: 100,
+                dial_panics: false,
+            }
+        }
+
+        /// Fails the keepalive ping on `conn`, as on a broker restart.
+        pub(crate) async fn fail(conn: &Connection<TokioExecutor>) {
+            assert!(conn.sender().send_ping().await.is_err());
+            assert!(!conn.is_valid(), "a failed ping retires the connection");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): a request the broker is slow to answer fails
+    /// alone; only the keepalive ping retires a connection (as the Java
+    /// client does), so one slow lookup never drops every consumer on it.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_slow_request_does_not_retire_the_connection() {
+        let (manager, broker) = silent_broker::manager().await;
+        let conn = manager.get_connection(&broker).await.unwrap();
+        let lookup = conn.sender().lookup_topic("persistent://t/n/x", false);
+        assert!(lookup.await.is_err(), "the unanswered lookup times out");
+        assert!(conn.is_valid(), "a request timeout retired the connection");
+        let again = manager.get_connection(&broker).await.unwrap();
+        assert_eq!(again.id(), conn.id());
+    }
+
+    /// FORK-PATCH (3rdi): callers replacing the same dead connection at
+    /// once share one new connection instead of dialing one each.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn concurrent_callers_share_one_replacement_connection() {
+        let (manager, broker) = silent_broker::manager().await;
+        let dead = manager.get_connection(&broker).await.unwrap();
+        silent_broker::fail(&dead).await;
+
+        let (a, b) = futures::join!(
+            manager.get_connection(&broker),
+            manager.get_connection(&broker)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.id(), dead.id());
+        assert_eq!(a.id(), b.id(), "each caller dialed its own connection");
+    }
+
+    /// FORK-PATCH (3rdi): the caller that claimed a dial can be cancelled
+    /// (an application timeout, an aborted task, a lost `select!`) without
+    /// stranding the callers queued behind it: the dial runs detached.
+    #[tokio::test(start_paused = true)]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_cancelled_dial_strands_no_later_caller() {
+        // a broker that accepts the socket and never answers CommandConnect
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let manager = silent_broker::undialed_manager(&format!("pulsar://127.0.0.1:{port}"));
+        let broker = manager.get_base_address();
+
+        {
+            let first = manager.get_connection(&broker);
+            futures::pin_mut!(first);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+        } // the claiming caller is dropped mid-dial
+
+        let second =
+            tokio::time::timeout(Duration::from_secs(3600), manager.get_connection(&broker)).await;
+        assert!(second.is_ok(), "a cancelled dial stranded the next caller");
+    }
+
+    /// A broker that accepts the socket and never answers CommandConnect;
+    /// its `pulsar://` URL.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn mute_broker() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        format!("pulsar://127.0.0.1:{port}")
+    }
+
+    /// FORK-PATCH (3rdi): a dial that panics fails its waiters with
+    /// `Unexpected` and clears the entry, so the next caller dials anew.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_panicking_dial_fails_its_waiters_and_clears_the_entry() {
+        let mut manager = silent_broker::undialed_manager(&mute_broker().await);
+        manager.dial_panics = true;
+        let broker = manager.get_base_address();
+        let got = tokio::time::timeout(Duration::from_secs(10), manager.get_connection(&broker))
+            .await
+            .expect("the waiter of a panicked dial was stranded");
+        assert!(
+            matches!(got, Err(ConnectionError::Unexpected(_))),
+            "{:?}",
+            got.map(|c| c.id())
+        );
+        assert!(manager.connections.lock().await.get(&broker).is_none());
+    }
+
+    /// FORK-PATCH (3rdi): once a connection failed, the pool hands out a
+    /// new one, even after a consumer engine read the error
+    /// (prophesee-service-rs #284).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn the_pool_replaces_a_connection_whose_error_was_read() {
+        let (manager, broker) = silent_broker::manager().await;
+        let dead = manager.get_connection(&broker).await.unwrap();
+        silent_broker::fail(&dead).await;
+        assert!(dead.error().is_some(), "the engine reads the error");
+
+        let next = manager.get_connection(&broker).await.unwrap();
+        assert_ne!(
+            next.id(),
+            dead.id(),
+            "the pool handed out the dead connection"
+        );
+        assert!(next.is_valid());
+    }
 
     #[test]
     fn test_allow_retry_no_max_retries() {
@@ -180,6 +448,9 @@ pub struct ConnectionManager<Exe: Executor> {
     pub(crate) tls_options: TlsOptions,
     certificate_chain: Vec<Certificate>,
     outbound_channel_size: usize,
+    /// Test seam: the dial panics.
+    #[cfg(test)]
+    dial_panics: bool,
 }
 
 impl<Exe: Executor> ConnectionManager<Exe> {
@@ -248,6 +519,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             tls_options,
             certificate_chain,
             outbound_channel_size,
+            #[cfg(test)]
+            dial_panics: false,
         };
         let broker_address = BrokerAddress {
             url: url.clone(),
@@ -290,10 +563,17 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         trace!("Looking for connection to {}...", broker.url);
         let rx = {
             let mut conns = self.connections.lock().await;
-            match conns.get_mut(broker) {
+            // FORK-PATCH (3rdi): a caller that finds no usable connection
+            // claims the dial under this lock (`Connecting`), so callers
+            // racing it queue for its connection instead of each dialing
+            // one (upstream left the entry as it was until `connect_inner`).
+            // The dial runs detached and every caller, the claimer too,
+            // waits for it the same way, so cancelling any of them strands
+            // no one.
+            let claim = match conns.get_mut(broker) {
                 None => {
                     trace!("[] no connection for {}", broker.url);
-                    None
+                    true
                 }
                 Some(ConnectionStatus::Connected { conn, last_used }) => {
                     if conn.is_valid() {
@@ -303,33 +583,72 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         return Ok(conn.clone());
                     } else {
                         warn!("[connected] invalid connection for {}", broker.url);
-                        None
+                        true
                     }
                 }
-                Some(ConnectionStatus::Connecting(ref mut v)) => {
-                    let (tx, rx) = oneshot::channel();
-                    debug!(
-                        "[connecting...] existing pending connection to {}",
-                        broker.url
-                    );
-                    v.push(tx);
-                    Some(rx)
+                Some(ConnectionStatus::Connecting(_)) => false,
+            };
+            let (tx, rx) = oneshot::channel();
+            if claim {
+                info!("No existing connection, creating new for {}", broker.url);
+                conns.insert(broker.clone(), ConnectionStatus::Connecting(vec![tx]));
+                let manager = self.clone();
+                let dial = broker.clone();
+                let spawned = self
+                    .executor
+                    .spawn(Box::pin(async move { manager.dial_detached(dial).await }));
+                if spawned.is_err() {
+                    error!("the executor could not spawn the dial to {}", broker.url);
+                    if let Some(ConnectionStatus::Connecting(v)) = conns.remove(broker) {
+                        for tx in v {
+                            let _ = tx.send(Err(ConnectionError::Shutdown));
+                        }
+                    }
                 }
+            } else if let Some(ConnectionStatus::Connecting(v)) = conns.get_mut(broker) {
+                debug!(
+                    "[connecting...] existing pending connection to {}",
+                    broker.url
+                );
+                v.push(tx);
             }
+            rx
         };
 
-        match rx {
-            None => {
-                info!("No existing connection, creating new for {}", broker.url);
-                self.connect(broker.clone()).await
+        match rx.await {
+            Ok(res) => {
+                debug!("Connection found for {}", broker.url);
+                res
             }
-            Some(rx) => match rx.await {
-                Ok(res) => {
-                    debug!("Connection found for {}", broker.url);
-                    res
-                }
-                Err(_) => Err(ConnectionError::Canceled),
-            },
+            Err(_) => Err(ConnectionError::Canceled),
+        }
+    }
+
+    /// FORK-PATCH (3rdi): dials `broker` for the callers queued on its
+    /// `Connecting` entry, detached from all of them. Whatever ends the
+    /// dial (an error, a panic, a failed keepalive spawn) resolves every
+    /// waiter and clears the entry, so no later caller queues forever.
+    async fn dial_detached(self, broker: BrokerAddress) {
+        use futures::FutureExt;
+        let dialed = std::panic::AssertUnwindSafe(self.connect_claimed(broker.clone(), true))
+            .catch_unwind()
+            .await;
+        let err = match dialed {
+            Ok(Ok(_)) => return,
+            Ok(Err(e)) => e,
+            Err(_) => ConnectionError::Unexpected("the connection dial panicked".to_string()),
+        };
+        let waiting = {
+            let mut conns = self.connections.lock().await;
+            match conns.get(&broker) {
+                Some(ConnectionStatus::Connecting(_)) => conns.remove(&broker),
+                _ => None,
+            }
+        };
+        if let Some(ConnectionStatus::Connecting(v)) = waiting {
+            for tx in v {
+                let _ = tx.send(Err(for_waiter(&err)));
+            }
         }
     }
 
@@ -337,8 +656,11 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     async fn connect_inner(
         &self,
         broker: &BrokerAddress,
+        claimed: bool,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let rx = {
+        let rx = if claimed {
+            None
+        } else {
             match self
                 .connections
                 .lock()
@@ -363,6 +685,11 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 Ok(res) => res,
                 Err(_) => Err(ConnectionError::Canceled),
             };
+        }
+
+        #[cfg(test)]
+        if self.dial_panics {
+            panic!("injected dial panic");
         }
 
         let proxy_url = if broker.proxy {
@@ -449,7 +776,18 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: BrokerAddress,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let c = match self.connect_inner(&broker).await {
+        self.connect_claimed(broker, false).await
+    }
+
+    /// `claimed`: the caller already set this broker's entry to
+    /// `Connecting` and is the one to dial.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn connect_claimed(
+        &self,
+        broker: BrokerAddress,
+        claimed: bool,
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
+        let c = match self.connect_inner(&broker, claimed).await {
             Err(e) => {
                 // the current ConnectionStatus is Connecting, containing
                 // notification channels for all the tasks waiting for the
@@ -460,9 +798,10 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                     self.connections.lock().await.remove(&broker)
                 {
                     for tx in v.drain(..) {
-                        // we cannot clone ConnectionError so we tell other
-                        // tasks that reconnection is canceled
-                        let _ = tx.send(Err(ConnectionError::Canceled));
+                        // FORK-PATCH (3rdi): every waiter gets the dial's
+                        // own failure (upstream sent Canceled), so it
+                        // classifies the retry the same way the dialer does
+                        let _ = tx.send(Err(for_waiter(&e)));
                     }
                 }
 

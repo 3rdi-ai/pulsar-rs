@@ -621,11 +621,13 @@ impl SharedError {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    // FORK-PATCH (3rdi): takes the error but leaves the flag set. Upstream
+    // cleared `error_set` here, so reading the error of a timed-out
+    // connection made `is_valid()` true again and the connection manager
+    // kept handing out the dead connection. A connection never recovers
+    // from an error; the manager drops it and dials a new one.
     pub fn remove(&self) -> Option<ConnectionError> {
-        let mut lock = self.error.lock().unwrap();
-        let error = lock.take();
-        self.error_set.store(false, Ordering::Release);
-        error
+        self.error.lock().unwrap().take()
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
