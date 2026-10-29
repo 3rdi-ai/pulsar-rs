@@ -276,6 +276,29 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
+    /// FORK-PATCH (3rdi): how many reconnects (resubscribes) this
+    /// consumer's engines have started: a transient reconnect failure is
+    /// retried inside the engine and never reaches the stream, so this is
+    /// how an application sees one. For a multi-topic consumer, the sum over
+    /// the topics it currently consumes. Lock-free.
+    pub fn reconnect_attempts(&self) -> u64 {
+        match &self.inner {
+            InnerConsumer::Single(c) => c.reconnect_attempts(),
+            InnerConsumer::Multi(c) => c.consumers.values().map(|c| c.reconnect_attempts()).sum(),
+        }
+    }
+
+    /// FORK-PATCH (3rdi): whether a reconnect is under way (from its start
+    /// until one succeeds, or the consumer ends): the consumer has no
+    /// working subscription meanwhile. For a multi-topic consumer, whether
+    /// any topic's is. Lock-free.
+    pub fn is_reconnecting(&self) -> bool {
+        match &self.inner {
+            InnerConsumer::Single(c) => c.is_reconnecting(),
+            InnerConsumer::Multi(c) => c.consumers.values().any(|c| c.is_reconnecting()),
+        }
+    }
+
     /// returns the list of topics this consumer is subscribed on
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn topics(&self) -> Vec<String> {
@@ -2249,6 +2272,9 @@ mod tests {
             0,
             "the old session's redelivery timers are cleared"
         );
+        // FORK-PATCH (3rdi): the reconnect shows on the consumer, and is over
+        assert!(consumer.reconnect_attempts() >= 1);
+        assert!(!consumer.is_reconnecting());
 
         producer
             .send_non_blocking(b"end".to_vec())
