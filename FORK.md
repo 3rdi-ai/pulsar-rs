@@ -72,9 +72,15 @@ messages can raise it on purpose.
 - **A failed reconnect is retried, never the end of the consumer**
   (FORK-PATCH in `src/consumer/engine.rs` `engine`): upstream returned the
   error when the reconnect off a dead connection failed (a lookup during a
-  broker restart), so the consumer died. It is now retried on the
+  broker restart), so the consumer died. A transient failure (I/O or a
+  timeout, a dropped connection, ServiceNotReady, ConsumerBusy, a lookup
+  MetadataError or TooManyRequests, a DNS failure) is now retried on the
   forced-resubscribe backoff (100 ms doubling to 60 s, the Java client's),
-  and no flow is sent on the dead connection meanwhile
+  and no flow is sent on the dead connection meanwhile. A permanent one
+  (topic not found or terminated, not authorized, incompatible schema)
+  still ends the engine, so it reaches the user instead of retrying
+  forever. A pending corrupt-window resubscribe never delays the reconnect
+  off a failed connection, and each retry logs its own reason
   (prophesee-service-rs #284).
 
 - **OAuth2 and Basic credentials never reach formatted output**: the
