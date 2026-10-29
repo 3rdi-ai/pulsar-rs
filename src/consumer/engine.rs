@@ -134,6 +134,11 @@ impl Pending {
     }
 }
 
+/// FORK-PATCH (3rdi): how long a reconnect waits for the broker to answer
+/// the close of the consumer on a failed connection: a broker still behind
+/// the socket answers in milliseconds, one that is gone never does.
+const DEAD_CONNECTION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The first forced-resubscribe delay, and the most it backs off to: the
 /// Java client's reconnection backoff (`initialBackoffInterval` 100 ms,
 /// `maxBackoffInterval` 60 s). One forged entry on an honest subscription
@@ -1001,7 +1006,26 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
         // stopping the current Message source
-        if let Err(e) = self.connection.sender().close_consumer(self.id).await {
+        // FORK-PATCH (3rdi): on a failed connection the close is best
+        // effort, bounded by DEAD_CONNECTION_CLOSE_TIMEOUT. Upstream waited
+        // out the whole operation timeout (30 s by default) for an answer a
+        // broker that is gone never sends; a broker still behind the socket
+        // answers within the bound, so an exclusive subscription is still
+        // released before it is taken again.
+        let close = self.connection.sender().close_consumer(self.id);
+        let closed = if self.connection.is_valid() {
+            close.await
+        } else {
+            Self::timeout(close, DEAD_CONNECTION_CLOSE_TIMEOUT)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ConnectionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "no answer to the close on a failed connection",
+                    )))
+                })
+        };
+        if let Err(e) = closed {
             error!(
                 "could not close consumer {:?}({}) for topic {}: {:?}",
                 self.name, self.id, self.topic, e
@@ -1311,6 +1335,68 @@ mod tests {
         engine.forced.pending = Some(Pending::CorruptWindow);
         engine.reconnect_failures.store(1, Ordering::SeqCst);
         run_until_injected(&mut engine, &mut injected, 1).await;
+    }
+
+    /// FORK-PATCH (3rdi): a reconnect off a failed connection still sends
+    /// CloseConsumer, but does not wait out the operation timeout for an
+    /// answer a broker that is gone never sends (upstream did: 30 s by
+    /// default before the consumer could look its topic up again).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_reconnect_off_a_failed_connection_does_not_wait_out_the_close() {
+        use crate::{
+            connection_manager::{tests::silent_broker, OperationRetryOptions},
+            consumer::queue::receive_queue,
+            Pulsar, TokioExecutor,
+        };
+
+        let (url, mut seen) = silent_broker::listen().await;
+        let client = Pulsar::builder(url, TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        conn.fail_for_test();
+
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        // stop the reconnect right after the close, before the lookup
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        let reconnected = tokio::time::timeout(Duration::from_secs(10), engine.reconnect())
+            .await
+            .expect("the reconnect waited out the close's operation timeout");
+        assert!(reconnected.is_err());
+
+        let mut closed = false;
+        while let Ok(cmd) = seen.try_recv() {
+            closed |= cmd.close_consumer.is_some();
+        }
+        assert!(closed, "the best-effort close was sent");
     }
 
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
