@@ -69,6 +69,13 @@ messages can raise it on purpose.
   every waiter and clears the entry. Waiters get a copy of the dial's own
   error (same variant, same I/O kind) instead of upstream's `Canceled`, so
   they classify the retry the same way.
+- **A failed reconnect is retried, never the end of the consumer**
+  (FORK-PATCH in `src/consumer/engine.rs` `engine`): upstream returned the
+  error when the reconnect off a dead connection failed (a lookup during a
+  broker restart), so the consumer died. It is now retried on the
+  forced-resubscribe backoff (100 ms doubling to 60 s, the Java client's),
+  and no flow is sent on the dead connection meanwhile
+  (prophesee-service-rs #284).
 
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its

@@ -69,6 +69,10 @@ fn warn_due(last: Option<Instant>, now: Instant) -> bool {
     !matches!(last, Some(last) if now.saturating_duration_since(last) < NON_POSITIVE_COUNT_WARN_INTERVAL)
 }
 
+/// Why a forced resubscribe is scheduled for a corrupt permit window.
+const FORCED_RESUBSCRIBE_REASON: &str =
+    "a non-positive batch count corrupted the broker's permit window";
+
 /// The first forced-resubscribe delay, and the most it backs off to: the
 /// Java client's reconnection backoff (`initialBackoffInterval` 100 ms,
 /// `maxBackoffInterval` 60 s). One forged entry on an honest subscription
@@ -311,8 +315,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         debug!("starting the consumer engine for topic {}", self.topic);
 
         loop {
-            if connection_failed(&self.connection) {
-                self.reconnect().await?;
+            // FORK-PATCH (3rdi): a failed reconnect is retried on the
+            // forced-resubscribe backoff (the branch below fires it once
+            // due), never the end of the engine; upstream returned the
+            // error, so one lookup failing during a broker restart killed
+            // the consumer.
+            if self.forced.due.is_none() && connection_failed(&self.connection) {
+                if let Err(e) = self.reconnect().await {
+                    warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
+                    self.schedule_resubscribe(true, "the connection failed");
+                }
             }
 
             if self.forced.due.is_some_and(|due| Instant::now() >= due) {
@@ -323,7 +335,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         "{}: forced resubscribe failed: {e}; retrying",
                         self.debug_format()
                     );
-                    self.schedule_forced_resubscribe(true);
+                    self.schedule_resubscribe(true, FORCED_RESUBSCRIBE_REASON);
                 }
             }
 
@@ -364,7 +376,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = 4294967096, no flow message trigger) [underflow on remaining messages - without the patch]
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = -1124, flow message trigger, ask broker to send =>  batch_size - remaining_messages = 2124) [no underflow on remaining messages - with the patch]
             // ```
-            if needs_flow(self.batch_size, self.remaining_messages) {
+            // FORK-PATCH (3rdi): no flow on a dead connection while its
+            // reconnect waits out the backoff (a send failing there loops).
+            if self.connection.is_valid() && needs_flow(self.batch_size, self.remaining_messages) {
                 let permits = flow_permits(self.batch_size, self.remaining_messages);
                 match self.connection.sender().send_flow(self.id, permits).await {
                     Ok(()) => {}
@@ -849,6 +863,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// connection, so the broker settles the entry before the new session.
     /// `after_failure` reschedules a forced resubscribe that just failed.
     fn schedule_forced_resubscribe(&mut self, after_failure: bool) {
+        self.schedule_resubscribe(after_failure, FORCED_RESUBSCRIBE_REASON);
+    }
+
+    /// Schedules a resubscribe on the forced-resubscribe backoff; `reason`
+    /// is logged.
+    fn schedule_resubscribe(&mut self, after_failure: bool, reason: &str) {
         let (now, initial) = (Instant::now(), self.forced_initial_backoff);
         let scheduled = if after_failure {
             self.forced.retry(now, initial)
@@ -860,7 +880,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         };
         let scheduled = self.forced_resubscribes.fetch_add(1, Ordering::SeqCst) + 1;
         warn!(
-            "{}: a non-positive batch count corrupted the broker's permit window; resubscribing in {delay:?} (forced resubscribe #{scheduled})",
+            "{}: {reason}; resubscribing in {delay:?} (forced resubscribe #{scheduled})",
             self.debug_format()
         );
     }
@@ -1001,6 +1021,82 @@ fn connection_failed<Exe: Executor>(connection: &Connection<Exe>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FORK-PATCH (3rdi): a failed reconnect off a dead connection is
+    /// retried with the backoff; upstream ended the engine, so the consumer
+    /// died on the first lookup that failed during a broker restart.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_reconnect_is_retried() {
+        use crate::{
+            connection_manager::{tests::silent_broker, OperationRetryOptions},
+            consumer::queue::receive_queue,
+            Pulsar, TokioExecutor,
+        };
+
+        let (url, _seen) = silent_broker::listen().await;
+        let client = Pulsar::builder(url, TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        silent_broker::fail(&conn).await;
+
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        let failures = engine.reconnect_failures();
+        failures.store(3, Ordering::SeqCst);
+
+        // the engine keeps going until every injected failure is spent and
+        // it is on to a real lookup; upstream returned after the first
+        let ran = tokio::time::timeout(Duration::from_secs(5), async {
+            let (spent_tx, spent_rx) = futures::channel::oneshot::channel::<()>();
+            let watch = {
+                let failures = Arc::clone(&failures);
+                async move {
+                    while failures.load(Ordering::SeqCst) != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    let _ = spent_tx.send(());
+                }
+            };
+            tokio::spawn(watch);
+            futures::future::select(Box::pin(engine.engine()), spent_rx).await
+        })
+        .await
+        .expect("the engine neither ended nor spent its retries");
+        match ran {
+            futures::future::Either::Left((res, _)) => {
+                panic!("the engine ended on a failed reconnect: {res:?}")
+            }
+            futures::future::Either::Right(_) => {}
+        }
+    }
 
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
     /// multi-topic consumer, pool members) must both reconnect, not only the
