@@ -110,6 +110,22 @@ messages can raise it on purpose.
   error and drops that topic (`consumer/multi.rs`, upstream behaviour for
   any error item, refused messages included); passing it to the user
   there is a separate, larger change.
+- **A reply nobody waits for is dropped; a timed-out request forgets its
+  resolver** (FORK-PATCH in `src/connection.rs` `Receiver`): now that a
+  timeout no longer retires the connection, an unanswered request would
+  keep its resolver for the connection's lifetime, and upstream kept every
+  unmatched reply forever too. On timeout the request is cancelled
+  (`Register::CancelRequest`). A request registers before it is written,
+  so a reply can only be read ahead of a registration still in the
+  channel: before routing an unmatched reply the receiver drains the
+  registrations once more, and a reply still unmatched after that is
+  stale and dropped. This also settles upstream's CloseConsumer FIXME (a
+  reply to our own close is never taken for a broker-initiated close)
+  and keeps a resend's receipt (a reused `ProducerSend` key) deliverable.
+  One exception is kept: a producer's exclusive-access answer comes
+  unrequested and its waiter registers only after the first answer, so an
+  unmatched `producer_success` is kept for it, as upstream did. `SerialId`
+  is 64-bit on every target.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
