@@ -130,6 +130,41 @@ messages can raise it on purpose.
   unmatched `producer_success` is kept for it, as upstream did.
   `SerialId` is an `AtomicU64`, which needs 64-bit atomics on the target
   (every target we build for has them; one without would not compile).
+- **Key_Shared recovers from a non-positive batch count on a 4.0.x
+  broker** (FORK-PATCH in `src/consumer/engine.rs`
+  `forged_count_corrupts_window`): a 4.0.x broker (4.0.8 is what the Helm
+  chart 4.4.0 that Scania runs ships) delivers an entry declaring a
+  non-positive count on Key_Shared and debits it, which wraps its permit
+  window (measured: `availablePermits` -2147482648 after `i32::MIN`) and
+  stalls dispatch. The client refuses the entry, as before, and now also
+  recovers with one forced resubscribe, as on Exclusive/Failover.
+  Measured broker matrix (`pulsar standalone`, forged `i32::MIN` and `-1`
+  on Key_Shared):
+
+  | broker | the entry | outcome with this change |
+  |---|---|---|
+  | 3.3.0 | never delivered | dispatch stalls (no client-side repair) |
+  | 4.0.5 | delivered, window wrapped | refused, one resubscribe, recovers |
+  | 4.0.8 | delivered, window wrapped | refused, one resubscribe, recovers |
+  | 5.0.0 | never delivered | dispatch stalls (no client-side repair) |
+
+  The Key_Shared test asserts the measured outcome per version and takes
+  an explicit, logged "unmeasured broker version" skip on any other.
+  **The cost:** each forced resubscribe closes this consumer, so the
+  broker moves its hash ranges to the other consumers and back, redelivers
+  its unacknowledged messages to them, and while it drains them can
+  briefly hold dispatch to the others. A publisher that keeps forging such
+  entries therefore causes churn across the whole subscription (bounded by
+  the forced-resubscribe backoff, at most one a minute per consumer once
+  it backs off). That still beats the alternative on these brokers: a
+  permanent stall of the subscription that only a restart repairs. The
+  publisher trust boundary remains the defence (the producer-trust
+  statement under `.8`).
+- **Known on a 3.3.0 broker (not one we run the Rust client against):** on
+  Shared, an entry declaring a count above the 5000-member cap (70000,
+  `i32::MAX`) leaves the consumer `blockedConsumerOnUnackedMsgs` with 0
+  unacked after the client refuses and acknowledges it, so dispatch stops;
+  4.0.5, 4.0.8 and 5.0.0 do not. The two Shared tests fail on 3.3.0.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

@@ -79,3 +79,48 @@ pub(crate) async fn consumer_stats_when(
     }
     panic!("consumer stats never became ready: {last}");
 }
+
+/// The test broker's version as the admin API reports it: some
+/// consume-path tests assert per measured broker version (a broker's
+/// dispatcher changed how it treats a forged batch count between releases).
+#[cfg(test)]
+pub(crate) async fn broker_version() -> String {
+    reqwest::get("http://127.0.0.1:8080/admin/v2/brokers/version")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// A plain `major.minor.patch` release version, `None` for anything else
+/// (a SNAPSHOT or other suffix, a fourth part, garbage): such a broker is
+/// unmeasured.
+#[cfg(test)]
+pub(crate) fn release_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.trim().trim_matches('"').split('.');
+    let mut next = || {
+        parts
+            .next()
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse().ok())
+    };
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+#[cfg(test)]
+mod release_version_tests {
+    use super::release_version;
+
+    #[test]
+    fn only_a_plain_release_version_parses() {
+        assert_eq!(release_version("4.0.8"), Some((4, 0, 8)));
+        assert_eq!(release_version("\"5.0.0\"\n"), Some((5, 0, 0)));
+        assert_eq!(release_version("4.0.8-SNAPSHOT"), None);
+        assert_eq!(release_version("4.0.8.1"), None);
+        assert_eq!(release_version("4.0"), None);
+        assert_eq!(release_version("v4.0.8"), None);
+        assert_eq!(release_version(""), None);
+    }
+}

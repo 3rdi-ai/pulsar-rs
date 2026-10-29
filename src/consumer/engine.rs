@@ -38,7 +38,8 @@ use crate::{
 /// Zero or negative is booked as 1. The broker's window then drifts from
 /// this one (a single-active-consumer dispatcher credits a negative count,
 /// and `i32::MIN` overflows it), which no client booking repairs: on
-/// Exclusive/Failover the engine resubscribes (see
+/// Exclusive/Failover, and on Key_Shared against a 4.0.x broker that
+/// delivers the entry, the engine resubscribes (see
 /// [`forged_count_corrupts_window`]); on Shared the publisher trust boundary
 /// (mesh + publish authorization) is the defence.
 fn permits_consumed(num_messages_in_batch: Option<i32>) -> i64 {
@@ -212,10 +213,15 @@ impl ForcedResubscribe {
 /// broker's permit window corrupt for this subscription type, so only a
 /// fresh subscription (a new broker-side consumer) restores it. A
 /// single-active-consumer dispatcher credits a non-positive count and
-/// `i32::MIN` overflows its window; Shared skips the entry.
+/// `i32::MIN` overflows its window; Shared skips the entry. FORK-PATCH
+/// (3rdi): Key_Shared on a 4.0.x broker (the one Scania runs) delivers the
+/// entry and wraps its window too, so it recovers the same way; a 5.x
+/// broker never delivers the entry, so there this never fires.
 fn forged_count_corrupts_window(sub_type: SubType, num_messages_in_batch: Option<i32>) -> bool {
-    matches!(sub_type, SubType::Exclusive | SubType::Failover)
-        && matches!(num_messages_in_batch, Some(..=0))
+    matches!(
+        sub_type,
+        SubType::Exclusive | SubType::Failover | SubType::KeyShared
+    ) && matches!(num_messages_in_batch, Some(..=0))
 }
 
 const SYSTEM_PROPERTY_REAL_TOPIC: &str = "REAL_TOPIC";
@@ -1763,11 +1769,11 @@ mod tests {
         assert!(FORCED_RESUBSCRIBE_RESET_AFTER > FORCED_RESUBSCRIBE_MAX_BACKOFF);
     }
 
-    /// Only a single-active-consumer subscription with a non-positive count
-    /// needs the forced resubscribe.
+    /// A non-positive count needs the forced resubscribe on every
+    /// subscription type but Shared (whose broker skips the entry).
     #[test]
-    fn only_a_single_active_consumer_window_needs_a_resubscribe() {
-        for sub_type in [SubType::Exclusive, SubType::Failover] {
+    fn a_non_positive_count_needs_a_resubscribe_except_on_shared() {
+        for sub_type in [SubType::Exclusive, SubType::Failover, SubType::KeyShared] {
             for count in [0, -1, i32::MIN] {
                 assert!(
                     forged_count_corrupts_window(sub_type, Some(count)),
@@ -1779,10 +1785,6 @@ mod tests {
         }
         for count in [0, -1, i32::MIN] {
             assert!(!forged_count_corrupts_window(SubType::Shared, Some(count)));
-            assert!(!forged_count_corrupts_window(
-                SubType::KeyShared,
-                Some(count)
-            ));
         }
     }
 
