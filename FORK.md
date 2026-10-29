@@ -172,7 +172,9 @@ messages can raise it on purpose.
   are one step under the pool lock, so a caller arriving after it finds
   no entry and starts a fresh dial (one arriving before keeps this dial
   going), and the dial that gave up never touches an entry it no longer
-  owns.
+  owns. The check runs after each backoff, so an abandoned dial still makes
+  the one full `Connection::new` attempt it is in (up to the connection
+  timeout) and its backoff before it gives up.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

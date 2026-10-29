@@ -722,8 +722,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         let err = match dialed {
             Ok(Ok(_)) => return,
             // its entry is gone (it had no waiter); any there now is a fresh
-            // dial's
+            // dial's, whether the dial then returned or panicked
             Ok(Err(_)) if gave_up => return,
+            Err(_) if gave_up => return,
             Ok(Err(e)) => e,
             Err(_) => ConnectionError::Unexpected("the connection dial panicked".to_string()),
         };
