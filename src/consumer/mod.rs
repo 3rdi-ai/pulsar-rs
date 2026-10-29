@@ -298,8 +298,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     /// starts, cleared when one succeeds or when the engine ends with an
     /// error (a permanent failure). It stays as it was (frozen) if the
     /// engine panics or returns `Ok(())` (the consumer was closed or
-    /// dropped), and after a failed reconnect on a broker-initiated close:
-    /// that error goes to the stream and the engine does not retry it. For
+    /// dropped). For
     /// a multi-topic
     /// consumer, whether any current topic's is. Lock-free.
     pub fn is_reconnecting(&self) -> bool {

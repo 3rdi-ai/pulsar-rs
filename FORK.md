@@ -220,9 +220,15 @@ messages can raise it on purpose.
   The count only goes up: a seek (which rebuilds the consumer) and a
   multi-topic consumer dropping a topic keep the attempts already counted;
   "reconnecting" is any over a multi-topic consumer's current topics. The
-  flag stays set (frozen) if the engine panics or returns `Ok(())`, and
-  after a failed reconnect on a broker-initiated close, which is not
-  retried (its error goes to the stream).
+  flag stays set (frozen) if the engine panics or returns `Ok(())`.
+- **A reconnect on a broker-initiated close is retried** (FORK-PATCH in
+  `src/consumer/engine.rs` `process_message`): brokers close consumers on
+  every topic unload and bundle move (each broker roll). Upstream's
+  reconnect there had no retry: one failed lookup or subscribe sent its
+  error to the stream and left the consumer running with no
+  subscription. It now takes the same path as every other reconnect: a
+  transient failure is retried on the backoff, a permanent one ends the
+  consumer (its stream yields the error, then ends).
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
