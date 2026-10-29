@@ -140,6 +140,9 @@ pub(crate) struct Receiver<S: Stream<Item = Result<Message, ConnectionError>>> {
     pending_requests: BTreeMap<RequestKey, oneshot::Sender<Message>>,
     consumers: BTreeMap<u64, mpsc::UnboundedSender<Message>>,
     received_messages: BTreeMap<RequestKey, Message>,
+    /// FORK-PATCH (3rdi): the requests cancelled during the drain that
+    /// routes an unmatched reply (their late reply is not kept).
+    cancelled_in_drain: Vec<RequestKey>,
     registrations: Pin<Box<mpsc::UnboundedReceiver<Register>>>,
     shutdown: Pin<Box<oneshot::Receiver<()>>>,
     ping: Option<oneshot::Sender<()>>,
@@ -164,6 +167,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
             error,
             pending_requests: BTreeMap::new(),
             received_messages: BTreeMap::new(),
+            cancelled_in_drain: Vec::new(),
             consumers: BTreeMap::new(),
             registrations: Box::pin(registrations),
             shutdown: Box::pin(shutdown),
@@ -226,6 +230,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
                         self.pending_requests.remove(&key);
                     }
                     self.received_messages.remove(&key);
+                    self.cancelled_in_drain.push(key);
                 }
                 Poll::Ready(None) => {
                     self.error.set(ConnectionError::Disconnected);
@@ -240,19 +245,40 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
     /// is registered. A request registers before it is written, so a reply
     /// can only be read ahead of a registration still in the channel: the
     /// channel is drained once more before giving up on it.
-    fn resolver_for(
-        &mut self,
-        key: &RequestKey,
-        cx: &mut Context<'_>,
-    ) -> Result<Option<oneshot::Sender<Message>>, ()> {
+    fn resolver_for(&mut self, key: &RequestKey, cx: &mut Context<'_>) -> Result<Route, ()> {
+        // FORK-PATCH (3rdi): a resolver nobody waits on (its request was
+        // dropped, its cancellation still in the channel) counts as absent:
+        // a resend's registration may be behind it in the channel
+        let mut dead = false;
         if let Some(resolver) = self.pending_requests.remove(key) {
-            return Ok(Some(resolver));
+            if !resolver.is_canceled() {
+                return Ok(Route::To(resolver));
+            }
+            dead = true;
         }
+        self.cancelled_in_drain.clear();
         if !self.drain_registrations(cx) {
             return Err(());
         }
-        Ok(self.pending_requests.remove(key))
+        dead |= self.cancelled_in_drain.contains(key);
+        self.cancelled_in_drain.clear();
+        match self.pending_requests.remove(key) {
+            Some(resolver) if !resolver.is_canceled() => Ok(Route::To(resolver)),
+            Some(_) => Ok(Route::Dead),
+            None if dead => Ok(Route::Dead),
+            None => Ok(Route::Nobody),
+        }
     }
+}
+
+/// FORK-PATCH (3rdi): where a reply to a request goes.
+enum Route {
+    /// The request's resolver.
+    To(oneshot::Sender<Message>),
+    /// Its request was dropped or cancelled: nobody will ever want it.
+    Dead,
+    /// No request registered for it.
+    Nobody,
 }
 
 impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> {
@@ -300,21 +326,22 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                                 trace!("received this message: {:?}", msg);
                                 match self.resolver_for(&key, cx) {
                                     Err(()) => return Poll::Ready(Err(())),
-                                    Ok(Some(resolver)) => {
+                                    Ok(Route::To(resolver)) => {
                                         // We don't care if the receiver has dropped their future
                                         let _ = resolver.send(msg);
                                     }
                                     // FORK-PATCH (3rdi): the producer's exclusive-access
                                     // answer comes unrequested; its waiter registers only
-                                    // after the first answer, so it is kept for it
-                                    Ok(None) if msg.command.producer_success.is_some() => {
+                                    // after the first answer, so it is kept for it, unless
+                                    // its request is known dead (a dropped create-producer)
+                                    Ok(Route::Nobody) if msg.command.producer_success.is_some() => {
                                         self.received_messages.insert(key, msg);
                                     }
                                     // FORK-PATCH (3rdi): every registration is in, so
                                     // nobody waits for this reply (its request timed out
-                                    // and was cancelled): dropped, where upstream kept
-                                    // it for the connection's lifetime
-                                    Ok(None) => {
+                                    // or was dropped): dropped, where upstream kept it
+                                    // for the connection's lifetime
+                                    Ok(Route::Dead) | Ok(Route::Nobody) => {
                                         debug!("dropping a reply nobody waits for: {:?}", key);
                                     }
                                 }
@@ -337,11 +364,15 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                                     .resolver_for(&RequestKey::RequestId(request_id), cx)
                                 {
                                     Err(()) => return Poll::Ready(Err(())),
-                                    Ok(resolver) => resolver,
+                                    Ok(route) => route,
                                 };
-                                if let Some(resolver) = resolver {
+                                if let Route::To(resolver) = resolver {
                                     // We don't care if the receiver has dropped their future
                                     let _ = resolver.send(msg);
+                                } else if let Route::Dead = resolver {
+                                    // the answer to our own close, whose request was
+                                    // dropped: not a broker-initiated close
+                                    debug!("dropping the answer to a dropped close of consumer {consumer_id}");
                                 } else {
                                     let res = self
                                         .consumers
@@ -2657,6 +2688,150 @@ mod tests {
             "a stale reply was kept"
         );
         assert!(receiver.pending_requests.is_empty());
+    }
+
+    /// FORK-PATCH (3rdi): a request dropped but not yet cancelled (its
+    /// cancellation still in the channel) leaves a resolver nobody waits
+    /// on: a reply for a resend under the same key, read in the poll that
+    /// registers the resend, goes to the resend, not to the dead resolver.
+    #[tokio::test]
+    async fn a_dead_resolver_does_not_take_a_resends_reply() {
+        let (_message_tx, message_rx) = mpsc::unbounded();
+        let (control_tx, _control_rx) = async_channel::unbounded();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (_receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
+        let (auth_challenge_tx, _auth_challenge_rx) = mpsc::unbounded();
+        let key = RequestKey::ProducerSend {
+            producer_id: 1,
+            sequence_id: 5,
+        };
+        let (inbound, mut resent) = racing_inbound(
+            registrations_tx.clone(),
+            key.clone(),
+            send_receipt(1, 5),
+            message_rx,
+        );
+        let mut receiver = Receiver::new(
+            inbound,
+            control_tx,
+            SharedError::new(),
+            registrations_rx,
+            receiver_shutdown_rx,
+            auth_challenge_tx,
+            Default::default(),
+        );
+        // the first send registered, then its future was dropped; its
+        // cancellation has not reached the receiver yet
+        drop(register(&registrations_tx, key));
+
+        assert!(futures::poll!(&mut receiver).is_pending());
+        let msg = resent
+            .try_recv()
+            .unwrap()
+            .expect("the resend's receipt went to the dead resolver");
+        assert!(msg.command.send_receipt.is_some());
+    }
+
+    /// A receiver whose inbound stream, on its first poll, queues
+    /// `registrations` (as requests on other threads do, after the
+    /// receiver's first drain) and yields `reply`.
+    #[allow(clippy::type_complexity)]
+    fn receiver_racing(
+        registrations: Vec<Register>,
+        reply: Message,
+    ) -> Receiver<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Message, crate::error::ConnectionError>> + Send>,
+        >,
+    > {
+        let (control_tx, _control_rx) = async_channel::unbounded();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
+        let (auth_challenge_tx, _auth_challenge_rx) = mpsc::unbounded();
+        std::mem::forget(receiver_shutdown_tx);
+        let mut queued = Some((registrations, reply));
+        let inbound = futures::stream::poll_fn(move |_cx| match queued.take() {
+            Some((registrations, reply)) => {
+                for registration in registrations {
+                    registrations_tx.unbounded_send(registration).unwrap();
+                }
+                std::task::Poll::Ready(Some(Ok(reply)))
+            }
+            None => std::task::Poll::Pending,
+        });
+        Receiver::new(
+            Box::pin(inbound) as std::pin::Pin<Box<dyn futures::Stream<Item = _> + Send>>,
+            control_tx,
+            SharedError::new(),
+            registrations_rx,
+            receiver_shutdown_rx,
+            auth_challenge_tx,
+            Default::default(),
+        )
+    }
+
+    fn producer_success(request_id: u64) -> Message {
+        Message {
+            command: BaseCommand {
+                r#type: 17,
+                producer_success: Some(crate::proto::CommandProducerSuccess {
+                    request_id,
+                    producer_ready: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payload: None,
+        }
+    }
+
+    /// FORK-PATCH (3rdi): the producer_success of a create-producer that
+    /// was dropped (its registration and cancellation both arrive in the
+    /// drain that routes the reply) is not kept: nobody will ever want it.
+    #[tokio::test]
+    async fn a_dropped_create_producers_success_is_not_kept() {
+        let (resolver, response) = oneshot::channel();
+        drop(response);
+        let key = RequestKey::RequestId(9);
+        let mut receiver = receiver_racing(
+            vec![
+                Register::Request {
+                    key: key.clone(),
+                    resolver,
+                },
+                Register::CancelRequest { key },
+            ],
+            producer_success(9),
+        );
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert!(
+            receiver.received_messages.is_empty(),
+            "a dead request's producer_success was kept"
+        );
+        assert!(receiver.pending_requests.is_empty());
+    }
+
+    /// FORK-PATCH (3rdi): a dead registration (its future dropped, no
+    /// cancellation yet) and its reply both arrive after the first drain:
+    /// the reply is dropped (even a producer_success) and the dead resolver
+    /// goes.
+    #[tokio::test]
+    async fn a_reply_to_a_registration_dead_on_arrival_is_dropped() {
+        let (resolver, response) = oneshot::channel();
+        drop(response);
+        let mut receiver = receiver_racing(
+            vec![Register::Request {
+                key: RequestKey::RequestId(9),
+                resolver,
+            }],
+            producer_success(9),
+        );
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert!(receiver.received_messages.is_empty());
+        assert!(
+            receiver.pending_requests.is_empty(),
+            "the dead resolver was kept"
+        );
     }
 
     /// FORK-PATCH (3rdi): a producer resends under the same sequence id, so

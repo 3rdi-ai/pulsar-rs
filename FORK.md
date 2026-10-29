@@ -124,7 +124,9 @@ messages can raise it on purpose.
   registration still in the channel: before routing an unmatched reply
   the receiver drains the registrations once more, and a reply still
   unmatched after that is stale and dropped. This also settles upstream's
-  CloseConsumer FIXME and keeps a resend's receipt deliverable. One
+  CloseConsumer FIXME and keeps a resend's receipt deliverable; a
+  resolver whose request was dropped but not yet cancelled counts as
+  absent there, so it cannot take a resend's reply. One
   exception is kept: a producer's exclusive-access answer comes
   unrequested and its waiter registers only after the first answer, so an
   unmatched `producer_success` is kept for it, as upstream did.
