@@ -110,22 +110,26 @@ messages can raise it on purpose.
   error and drops that topic (`consumer/multi.rs`, upstream behaviour for
   any error item, refused messages included); passing it to the user
   there is a separate, larger change.
-- **A reply nobody waits for is dropped; a timed-out request forgets its
-  resolver** (FORK-PATCH in `src/connection.rs` `Receiver`): now that a
-  timeout no longer retires the connection, an unanswered request would
-  keep its resolver for the connection's lifetime, and upstream kept every
-  unmatched reply forever too. On timeout the request is cancelled
-  (`Register::CancelRequest`). A request registers before it is written,
-  so a reply can only be read ahead of a registration still in the
-  channel: before routing an unmatched reply the receiver drains the
-  registrations once more, and a reply still unmatched after that is
-  stale and dropped. This also settles upstream's CloseConsumer FIXME (a
-  reply to our own close is never taken for a broker-initiated close)
-  and keeps a resend's receipt (a reused `ProducerSend` key) deliverable.
-  One exception is kept: a producer's exclusive-access answer comes
+- **A reply nobody waits for is dropped; a request that ends unanswered
+  forgets its resolver** (FORK-PATCH in `src/connection.rs` `Receiver`,
+  `PendingRequest`): now that a timeout no longer retires the connection,
+  an unanswered request would keep its resolver for the connection's
+  lifetime, and upstream kept every unmatched reply forever too. A request
+  that ends without its answer (a timeout, its future dropped, even while
+  it waits for room on the data channel) drops its receiver end and then
+  cancels its registration (`Register::CancelRequest`); the receiver
+  forgets that resolver only (one whose receiver is gone), never a live
+  one a resend registered since under the same key. A request registers
+  before it is written, so a reply can only be read ahead of a
+  registration still in the channel: before routing an unmatched reply
+  the receiver drains the registrations once more, and a reply still
+  unmatched after that is stale and dropped. This also settles upstream's
+  CloseConsumer FIXME and keeps a resend's receipt deliverable. One
+  exception is kept: a producer's exclusive-access answer comes
   unrequested and its waiter registers only after the first answer, so an
-  unmatched `producer_success` is kept for it, as upstream did. `SerialId`
-  is 64-bit on every target.
+  unmatched `producer_success` is kept for it, as upstream did.
+  `SerialId` is an `AtomicU64`, which needs 64-bit atomics on the target
+  (every target we build for has them; one without would not compile).
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

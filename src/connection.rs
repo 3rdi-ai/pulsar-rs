@@ -103,6 +103,36 @@ impl crate::authentication::Authentication for Authentication {
     }
 }
 
+/// FORK-PATCH (3rdi): a registered request's answer, for as long as it is
+/// awaited. However the request ends without its answer (a timeout, its
+/// future dropped, even while it waits for room on the data channel), its
+/// registration is cancelled: the receiver end goes first, then
+/// `Register::CancelRequest`, so the connection's receiver forgets this
+/// request's resolver and no other.
+struct PendingRequest {
+    response: Option<oneshot::Receiver<Message>>,
+    key: Option<RequestKey>,
+    registrations: mpsc::UnboundedSender<Register>,
+}
+
+impl PendingRequest {
+    /// The answer came: nothing to cancel.
+    fn answered(&mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.response.take();
+        if let Some(key) = self.key.take() {
+            let _ = self
+                .registrations
+                .unbounded_send(Register::CancelRequest { key });
+        }
+    }
+}
+
 pub(crate) struct Receiver<S: Stream<Item = Result<Message, ConnectionError>>> {
     inbound: Pin<Box<S>>,
     control_tx: async_channel::Sender<Message>,
@@ -185,7 +215,16 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
                     self.ping = Some(resolver);
                 }
                 Poll::Ready(Some(Register::CancelRequest { key })) => {
-                    self.pending_requests.remove(&key);
+                    // only the cancelled request's own resolver (its
+                    // receiver is gone): a resend may have registered the
+                    // same key since
+                    if self
+                        .pending_requests
+                        .get(&key)
+                        .is_some_and(|resolver| resolver.is_canceled())
+                    {
+                        self.pending_requests.remove(&key);
+                    }
                     self.received_messages.remove(&key);
                 }
                 Poll::Ready(None) => {
@@ -805,27 +844,13 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         trace!("sending message(key = {:?}): {:?}", key, msg);
 
         let k = key.clone();
-        let cancel_key = key.clone();
         let error = self.error.clone();
-        let response = async move {
-            response
-                .await
-                .map_err(|oneshot::Canceled| {
-                    error!(
-                        "response has been canceled (key = {:?}), we are disconnected",
-                        k
-                    );
-                    error.set(ConnectionError::Disconnected);
-                    ConnectionError::Disconnected
-                })
-                .map(move |message: Message| {
-                    trace!("received message(key = {:?}): {:?}", k, message);
-                    extract_message(message, extract)
-                })?
-        };
 
         self.registrations
-            .unbounded_send(Register::Request { key, resolver })
+            .unbounded_send(Register::Request {
+                key: key.clone(),
+                resolver,
+            })
             .map_err(|e| {
                 warn!(
                     "connection {} disconnected when sending the Request: {}",
@@ -833,6 +858,13 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                 );
                 ConnectionError::Disconnected
             })?;
+        // FORK-PATCH (3rdi): from here on, a request that ends without its
+        // answer cancels its registration
+        let mut pending = PendingRequest {
+            response: Some(response),
+            key: Some(key),
+            registrations: self.registrations.clone(),
+        };
         match via {
             SendChannel::Control => {
                 self.control_tx.try_send(msg).map_err(|e| {
@@ -868,19 +900,31 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         };
 
         let connection_id = self.connection_id;
-        let registrations = self.registrations.clone();
         let delay_f = self.executor.delay(self.operation_timeout);
         trace!(
             "Create timeout futures with operation timeout at {:?}",
             self.operation_timeout
         );
         let fut = async move {
-            pin_mut!(response);
             pin_mut!(delay_f);
-            match select(response, delay_f).await {
-                Either::Left((res, _)) => {
-                    debug!("Received response: {:?}", res);
-                    res
+            let answer = match pending.response.as_mut() {
+                Some(response) => select(response, delay_f).await,
+                None => return Err(ConnectionError::Disconnected),
+            };
+            match answer {
+                Either::Left((Ok(message), _)) => {
+                    pending.answered();
+                    debug!("Received response: {:?}", message);
+                    trace!("received message(key = {:?}): {:?}", k, message);
+                    extract_message(message, extract)
+                }
+                Either::Left((Err(oneshot::Canceled), _)) => {
+                    error!(
+                        "response has been canceled (key = {:?}), we are disconnected",
+                        k
+                    );
+                    error.set(ConnectionError::Disconnected);
+                    Err(ConnectionError::Disconnected)
                 }
                 Either::Right(_) => {
                     warn!(
@@ -891,10 +935,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                     // only. Upstream also set the connection-wide error here,
                     // retiring the connection for every user of it; as in
                     // the Java client, only a failed keepalive ping does.
-                    // FORK-PATCH (3rdi): and the request is forgotten, so its
-                    // resolver does not stay for the connection's lifetime.
-                    let _ =
-                        registrations.unbounded_send(Register::CancelRequest { key: cancel_key });
+                    // The request is cancelled when `pending` drops.
                     Err(ConnectionError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -2378,19 +2419,229 @@ mod tests {
         response
     }
 
-    /// A reply the receiver reads ahead of its request's registration (a
-    /// registration still in the channel) is delivered.
+    /// An inbound stream that, on its first poll, registers `key` (as a
+    /// request on another thread does, after the receiver's first drain)
+    /// and yields `reply`; then it reads `rest`.
+    fn racing_inbound(
+        registrations_tx: mpsc::UnboundedSender<Register>,
+        key: RequestKey,
+        reply: Message,
+        mut rest: mpsc::UnboundedReceiver<Result<Message, crate::error::ConnectionError>>,
+    ) -> (
+        impl futures::Stream<Item = Result<Message, crate::error::ConnectionError>>,
+        oneshot::Receiver<Message>,
+    ) {
+        let (resolver, response) = oneshot::channel();
+        let mut resolver = Some(resolver);
+        let mut reply = Some(reply);
+        let inbound = futures::stream::poll_fn(move |cx| {
+            if let Some(resolver) = resolver.take() {
+                registrations_tx
+                    .unbounded_send(Register::Request {
+                        key: key.clone(),
+                        resolver,
+                    })
+                    .unwrap();
+                return std::task::Poll::Ready(reply.take().map(Ok));
+            }
+            rest.poll_next_unpin(cx)
+        });
+        (inbound, response)
+    }
+
+    /// A reply read in the same poll as its request's registration, after
+    /// the receiver's first drain of the registrations, is delivered in that
+    /// poll.
     #[tokio::test]
     async fn a_reply_ahead_of_its_registration_is_delivered() {
-        let (mut receiver, message_tx, registrations_tx, _keep) = hand_polled_receiver();
-        message_tx.unbounded_send(Ok(lookup_reply(7))).unwrap();
-        let mut response = register(&registrations_tx, RequestKey::RequestId(7));
+        let (_message_tx, message_rx) = mpsc::unbounded();
+        let (control_tx, _control_rx) = async_channel::unbounded();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (_receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
+        let (auth_challenge_tx, _auth_challenge_rx) = mpsc::unbounded();
+        let (inbound, mut response) = racing_inbound(
+            registrations_tx.clone(),
+            RequestKey::RequestId(7),
+            lookup_reply(7),
+            message_rx,
+        );
+        let mut receiver = Receiver::new(
+            inbound,
+            control_tx,
+            SharedError::new(),
+            registrations_rx,
+            receiver_shutdown_rx,
+            auth_challenge_tx,
+            Default::default(),
+        );
         assert!(futures::poll!(&mut receiver).is_pending());
         let msg = response
             .try_recv()
             .unwrap()
             .expect("the early reply was lost");
         assert!(msg.command.lookup_topic_response.is_some());
+        assert!(receiver.received_messages.is_empty());
+    }
+
+    /// FORK-PATCH (3rdi): a producer's exclusive-access answer comes
+    /// unrequested and its waiter registers only after the first answer:
+    /// it is kept for that registration.
+    #[tokio::test]
+    async fn an_unrequested_producer_success_waits_for_its_registration() {
+        let (mut receiver, message_tx, registrations_tx, _keep) = hand_polled_receiver();
+        message_tx
+            .unbounded_send(Ok(Message {
+                command: BaseCommand {
+                    r#type: 17,
+                    producer_success: Some(crate::proto::CommandProducerSuccess {
+                        request_id: 9,
+                        producer_ready: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                payload: None,
+            }))
+            .unwrap();
+        assert!(futures::poll!(&mut receiver).is_pending());
+
+        let mut response = register(&registrations_tx, RequestKey::RequestId(9));
+        assert!(futures::poll!(&mut receiver).is_pending());
+        let msg = response
+            .try_recv()
+            .unwrap()
+            .expect("the exclusive-access answer was dropped");
+        assert!(msg.command.producer_success.is_some());
+    }
+
+    /// FORK-PATCH (3rdi): a cancellation forgets only the cancelled
+    /// request's resolver, never a live one registered since under the same
+    /// key (a resend).
+    #[tokio::test]
+    async fn a_cancellation_leaves_a_live_resolver_alone() {
+        let (mut receiver, _message_tx, registrations_tx, _keep) = hand_polled_receiver();
+        let key = RequestKey::ProducerSend {
+            producer_id: 1,
+            sequence_id: 5,
+        };
+        let _resent = register(&registrations_tx, key.clone());
+        registrations_tx
+            .unbounded_send(Register::CancelRequest { key })
+            .unwrap();
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert_eq!(
+            receiver.pending_requests.len(),
+            1,
+            "a live resolver was cancelled"
+        );
+    }
+
+    /// A sender wired to a hand-polled receiver, with a 1 s operation
+    /// timeout and a data channel of `data_capacity`.
+    #[allow(clippy::type_complexity)]
+    fn hand_polled_connection(
+        data_capacity: usize,
+    ) -> (
+        super::ConnectionSender<crate::TokioExecutor>,
+        Receiver<mpsc::UnboundedReceiver<Result<Message, crate::error::ConnectionError>>>,
+        (
+            mpsc::UnboundedSender<Result<Message, crate::error::ConnectionError>>,
+            async_channel::Receiver<Message>,
+            async_channel::Receiver<Message>,
+            mpsc::UnboundedReceiver<()>,
+        ),
+    ) {
+        let (message_tx, message_rx) = mpsc::unbounded();
+        let (control_tx, control_rx) = async_channel::unbounded();
+        let (data_tx, data_rx) = async_channel::bounded(data_capacity);
+        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
+        let (auth_challenge_tx, auth_challenge_rx) = mpsc::unbounded();
+        let error = SharedError::new();
+        let receiver = Receiver::new(
+            message_rx,
+            control_tx.clone(),
+            error.clone(),
+            registrations_rx,
+            receiver_shutdown_rx,
+            auth_challenge_tx,
+            Default::default(),
+        );
+        let sender = super::ConnectionSender::new(
+            Uuid::new_v4(),
+            data_tx,
+            control_tx,
+            registrations_tx,
+            receiver_shutdown_tx,
+            super::SerialId::new(),
+            error,
+            Arc::new(crate::TokioExecutor),
+            Duration::from_secs(1),
+            Default::default(),
+        );
+        (
+            sender,
+            receiver,
+            (message_tx, control_rx, data_rx, auth_challenge_rx),
+        )
+    }
+
+    /// FORK-PATCH (3rdi): a request that timed out forgets its resolver.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_request_forgets_its_resolver() {
+        let (sender, mut receiver, _keep) = hand_polled_connection(10);
+        let lookup = sender.lookup_topic("persistent://t/n/x", false);
+        futures::pin_mut!(lookup);
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert_eq!(receiver.pending_requests.len(), 1);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            futures::poll!(lookup.as_mut()),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert!(receiver.pending_requests.is_empty(), "the resolver leaked");
+    }
+
+    /// FORK-PATCH (3rdi): a request future dropped before its answer (an
+    /// application timeout, an aborted task) forgets its resolver too.
+    #[tokio::test]
+    async fn a_dropped_request_forgets_its_resolver() {
+        let (sender, mut receiver, _keep) = hand_polled_connection(10);
+        {
+            let lookup = sender.lookup_topic("persistent://t/n/x", false);
+            futures::pin_mut!(lookup);
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+        }
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert!(receiver.pending_requests.is_empty(), "the resolver leaked");
+    }
+
+    /// FORK-PATCH (3rdi): a send dropped while it waits for room on the
+    /// data channel (it registered, it was never written) forgets its
+    /// resolver.
+    #[tokio::test]
+    async fn a_send_dropped_while_blocked_forgets_its_resolver() {
+        let (sender, mut receiver, keep) = hand_polled_connection(1);
+        // the data channel is full
+        let _queued = keep.0.clone();
+        {
+            let first = sender.send(1, "p".to_string(), 0, Default::default(), true);
+            futures::pin_mut!(first);
+            let _ = futures::poll!(first.as_mut());
+        }
+        {
+            let blocked = sender.send(1, "p".to_string(), 1, Default::default(), true);
+            futures::pin_mut!(blocked);
+            assert!(
+                futures::poll!(blocked.as_mut()).is_pending(),
+                "the send waits for room"
+            );
+        }
+        assert!(futures::poll!(&mut receiver).is_pending());
+        assert!(receiver.pending_requests.is_empty(), "the resolver leaked");
     }
 
     /// FORK-PATCH (3rdi): a reply nobody waits for (its request timed out)
@@ -2457,7 +2708,9 @@ mod tests {
         );
 
         // the first send of PS(1,5) timed out and was cancelled
-        let _first = register(&registrations_tx, key.clone());
+        // (its future is dropped first, as the request guard does)
+        let first = register(&registrations_tx, key.clone());
+        drop(first);
         registrations_tx
             .unbounded_send(Register::CancelRequest { key })
             .unwrap();
