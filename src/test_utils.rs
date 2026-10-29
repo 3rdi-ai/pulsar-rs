@@ -70,7 +70,12 @@ pub(crate) async fn consumer_stats_when(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut last = serde_json::Value::Null;
     while std::time::Instant::now() < deadline {
-        let stats: serde_json::Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+        // a stats call that fails (the topic is moving, e.g. after an
+        // unload) counts as not ready yet
+        let stats: serde_json::Value = match client.get(&url).send().await {
+            Ok(resp) => resp.json().await.unwrap_or_default(),
+            Err(_) => serde_json::Value::Null,
+        };
         last = stats["subscriptions"][subscription]["consumers"][0].clone();
         if !last.is_null() && ready(&last) {
             return last;

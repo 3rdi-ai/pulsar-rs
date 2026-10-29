@@ -1311,43 +1311,6 @@ mod tests {
         }
     }
 
-    /// Waits until the broker reports a connected consumer on `subscription` again, after a topic
-    /// unload made the client reconnect. Fails the test after 30 s.
-    #[cfg(any(
-        feature = "tokio-runtime",
-        feature = "tokio-rustls-runtime-aws-lc-rs",
-        feature = "tokio-rustls-runtime-ring"
-    ))]
-    async fn wait_for_connected_consumer(topic: &str, subscription: &str) {
-        let url = format!("http://127.0.0.1:8080/admin/v2/persistent/public/default/{topic}/stats");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let connected = match reqwest::get(&url).await {
-                Ok(resp) if resp.status().is_success() => resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| {
-                        v.get("subscriptions")?
-                            .get(subscription)?
-                            .get("consumers")?
-                            .as_array()
-                            .map(|c| !c.is_empty())
-                    })
-                    .unwrap_or(false),
-                _ => false,
-            };
-            if connected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no consumer reconnected to {subscription} on {topic} after the unload"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
     #[tokio::test]
     #[cfg(any(
         feature = "tokio-runtime",
@@ -1421,7 +1384,8 @@ mod tests {
         // redelivered. Unloading the topic closes the cursor, which waits for pending
         // mark-delete writes and persists the position, so nothing is in flight at the seek.
         crate::test_utils::unload_topic("public", "default", &topic).await;
-        wait_for_connected_consumer(&topic, "seek_single_test").await;
+        // a consumer is connected to the subscription again after the unload
+        crate::test_utils::consumer_stats_when(&topic, "seek_single_test", |_| true).await;
 
         // // call seek(timestamp), roll back the consumer to start_time
         log::info!("calling seek method");
