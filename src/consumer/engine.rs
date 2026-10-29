@@ -69,6 +69,71 @@ fn warn_due(last: Option<Instant>, now: Instant) -> bool {
     !matches!(last, Some(last) if now.saturating_duration_since(last) < NON_POSITIVE_COUNT_WARN_INTERVAL)
 }
 
+/// FORK-PATCH (3rdi): whether a failed reconnect is worth retrying: the
+/// broker or the network was briefly away (I/O, a timeout, a dropped
+/// connection, a broker not ready or still holding the old consumer, a
+/// metadata hiccup or rate limit on lookup). Anything else (the topic is
+/// gone or terminated, the subscriber is not authorized, the schema is
+/// incompatible, a TLS failure, a DNS failure) is permanent and reaches the
+/// user. A DNS failure ends the engine as upstream: our clients reach the
+/// brokers through the stable proxy Service, so a restarted broker pod's
+/// headless DNS name never fails for them.
+fn reconnect_is_transient(e: &Error) -> bool {
+    use crate::{error::ServiceDiscoveryError, message::proto::ServerError};
+    fn server(code: &Option<ServerError>) -> bool {
+        matches!(
+            code,
+            Some(
+                ServerError::ServiceNotReady
+                    | ServerError::ConsumerBusy
+                    | ServerError::MetadataError
+                    | ServerError::TooManyRequests
+            )
+        )
+    }
+    fn connection(e: &ConnectionError) -> bool {
+        match e {
+            // a TLS failure (bad certificate data, permission denied) is
+            // not going away on a retry
+            ConnectionError::Io(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
+            ),
+            ConnectionError::Disconnected | ConnectionError::Canceled => true,
+            ConnectionError::PulsarError(code, _) => server(code),
+            e => e.establish_retryable(),
+        }
+    }
+    match e {
+        Error::Connection(e) => connection(e),
+        Error::Consumer(ConsumerError::Connection(e)) => connection(e),
+        Error::ServiceDiscovery(ServiceDiscoveryError::Connection(e)) => connection(e),
+        Error::ServiceDiscovery(ServiceDiscoveryError::Query(code, _)) => server(code),
+        Error::ServiceDiscovery(ServiceDiscoveryError::Canceled) => true,
+        _ => false,
+    }
+}
+
+/// FORK-PATCH (3rdi): why a resubscribe is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// The connection failed and a reconnect off it failed too.
+    ConnectionRetry,
+    /// A non-positive batch count corrupted the broker's permit window.
+    CorruptWindow,
+}
+
+impl Pending {
+    fn reason(self) -> &'static str {
+        match self {
+            Pending::ConnectionRetry => "the reconnect off a failed connection failed",
+            Pending::CorruptWindow => {
+                "a non-positive batch count corrupted the broker's permit window"
+            }
+        }
+    }
+}
+
 /// The first forced-resubscribe delay, and the most it backs off to: the
 /// Java client's reconnection backoff (`initialBackoffInterval` 100 ms,
 /// `maxBackoffInterval` 60 s). One forged entry on an honest subscription
@@ -94,6 +159,8 @@ fn forced_resubscribe_backoff(attempt: u32, initial: Duration) -> Duration {
 struct ForcedResubscribe {
     /// When the scheduled resubscribe is due, if one is.
     due: Option<Instant>,
+    /// Why the scheduled resubscribe is pending (set with `due`).
+    pending: Option<Pending>,
     /// The backoff step of the next one.
     attempt: u32,
     /// When the last one fired (or, once its reconnect is done, completed):
@@ -195,6 +262,14 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Test seam: how many coming `reconnect` calls fail before doing anything.
     #[cfg(test)]
     reconnect_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// Test seam: the injected failures are permanent (topic not found).
+    #[cfg(test)]
+    injected_permanent: bool,
+    /// Test seam: a notification per injected reconnect failure.
+    #[cfg(test)]
+    injected_tx: mpsc::UnboundedSender<()>,
+    #[cfg(test)]
+    injected_rx: Option<mpsc::UnboundedReceiver<()>>,
     /// Test seam: after every successful resubscribe, the count of messages
     /// still tracked for unacked redelivery.
     #[cfg(test)]
@@ -224,6 +299,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let (event_tx, event_rx) = mpsc::unbounded();
         #[cfg(test)]
         let (resubscribed_tx, resubscribed_rx) = mpsc::unbounded();
+        #[cfg(test)]
+        let (injected_tx, injected_rx) = mpsc::unbounded();
         ConsumerEngine {
             client,
             connection,
@@ -254,6 +331,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             },
             #[cfg(test)]
             reconnect_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(test)]
+            injected_permanent: false,
+            #[cfg(test)]
+            injected_tx,
+            #[cfg(test)]
+            injected_rx: Some(injected_rx),
             #[cfg(test)]
             resubscribed_tx,
             #[cfg(test)]
@@ -311,19 +394,44 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         debug!("starting the consumer engine for topic {}", self.topic);
 
         loop {
-            if connection_failed(&self.connection) {
-                self.reconnect().await?;
+            // FORK-PATCH (3rdi): a failed reconnect is retried on the
+            // forced-resubscribe backoff (the branch below fires it once
+            // due), never the end of the engine; upstream returned the
+            // error, so one lookup failing during a broker restart killed
+            // the consumer.
+            // A pending corrupt-window resubscribe does not hold back the
+            // reconnect off a failed connection; only a pending connection
+            // retry (already on the backoff) does. A permanent failure (see
+            // `reconnect_is_transient`) ends the engine, as upstream did.
+            if self.forced.pending != Some(Pending::ConnectionRetry)
+                && connection_failed(&self.connection)
+            {
+                if let Err(e) = self.reconnect().await {
+                    if !reconnect_is_transient(&e) {
+                        error!("{}: reconnect failed for good: {e}", self.debug_format());
+                        return Err(e);
+                    }
+                    warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
+                    self.schedule_resubscribe(true, Pending::ConnectionRetry);
+                }
             }
 
             if self.forced.due.is_some_and(|due| Instant::now() >= due) {
                 // A failed forced resubscribe is retried with the backoff,
-                // never the end of the engine (`reconnect` cleared `due`).
+                // never the end of the engine (`reconnect` cleared `due`),
+                // except a connection retry that failed for good.
+                let pending = self.forced.pending.unwrap_or(Pending::CorruptWindow);
                 if let Err(e) = self.reconnect().await {
+                    if pending == Pending::ConnectionRetry && !reconnect_is_transient(&e) {
+                        error!("{}: reconnect failed for good: {e}", self.debug_format());
+                        return Err(e);
+                    }
                     warn!(
-                        "{}: forced resubscribe failed: {e}; retrying",
-                        self.debug_format()
+                        "{}: {} and the resubscribe failed: {e}; retrying",
+                        self.debug_format(),
+                        pending.reason()
                     );
-                    self.schedule_forced_resubscribe(true);
+                    self.schedule_resubscribe(true, pending);
                 }
             }
 
@@ -364,7 +472,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = 4294967096, no flow message trigger) [underflow on remaining messages - without the patch]
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = -1124, flow message trigger, ask broker to send =>  batch_size - remaining_messages = 2124) [no underflow on remaining messages - with the patch]
             // ```
-            if needs_flow(self.batch_size, self.remaining_messages) {
+            // FORK-PATCH (3rdi): no flow on a dead connection while its
+            // reconnect waits out the backoff (a send failing there loops).
+            if self.connection.is_valid() && needs_flow(self.batch_size, self.remaining_messages) {
                 let permits = flow_permits(self.batch_size, self.remaining_messages);
                 match self.connection.sender().send_flow(self.id, permits).await {
                     Ok(()) => {}
@@ -849,6 +959,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// connection, so the broker settles the entry before the new session.
     /// `after_failure` reschedules a forced resubscribe that just failed.
     fn schedule_forced_resubscribe(&mut self, after_failure: bool) {
+        self.schedule_resubscribe(after_failure, Pending::CorruptWindow);
+    }
+
+    /// Schedules a resubscribe on the forced-resubscribe backoff; `reason`
+    /// is logged.
+    fn schedule_resubscribe(&mut self, after_failure: bool, pending: Pending) {
         let (now, initial) = (Instant::now(), self.forced_initial_backoff);
         let scheduled = if after_failure {
             self.forced.retry(now, initial)
@@ -858,10 +974,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let Some(delay) = scheduled else {
             return;
         };
+        self.forced.pending = Some(pending);
         let scheduled = self.forced_resubscribes.fetch_add(1, Ordering::SeqCst) + 1;
         warn!(
-            "{}: a non-positive batch count corrupted the broker's permit window; resubscribing in {delay:?} (forced resubscribe #{scheduled})",
-            self.debug_format()
+            "{}: {}; resubscribing in {delay:?} (forced resubscribe #{scheduled})",
+            self.debug_format(),
+            pending.reason()
         );
     }
 
@@ -877,6 +995,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         // redundant; and the old session's messages are redelivered on the
         // new one, so their redelivery timers go (Java's clearReceiverQueue).
         self.forced.due = None;
+        self.forced.pending = None;
         self.unacked_messages.clear();
 
         // send CloseConsumer to server
@@ -897,7 +1016,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(Error::Custom("injected reconnect failure".to_string()));
+            let _ = self.injected_tx.unbounded_send(());
+            return Err(if self.injected_permanent {
+                Error::ServiceDiscovery(crate::error::ServiceDiscoveryError::NotFound)
+            } else {
+                Error::Connection(ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected reconnect failure",
+                )))
+            });
         }
 
         let broker_address = self.client.lookup_topic(&self.topic).await?;
@@ -1001,6 +1128,190 @@ fn connection_failed<Exe: Executor>(connection: &Connection<Exe>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine on a connection that already failed (a ping went
+    /// unanswered), against the silent in-process broker.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn engine_on_a_failed_connection() -> (
+        ConsumerEngine<crate::TokioExecutor>,
+        mpsc::UnboundedReceiver<()>,
+        crate::consumer::queue::QueueReceiver,
+        (
+            mpsc::UnboundedSender<RawMessage>,
+            mpsc::UnboundedSender<EngineMessage<crate::TokioExecutor>>,
+        ),
+    ) {
+        use crate::{
+            connection_manager::{tests::silent_broker, OperationRetryOptions},
+            consumer::queue::receive_queue,
+            Pulsar, TokioExecutor,
+        };
+
+        let (url, _seen) = silent_broker::listen().await;
+        let client = Pulsar::builder(url, TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_millis(200),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        silent_broker::fail(&conn).await;
+
+        let (tx, rx) = receive_queue(10, 1 << 20);
+        let (messages_tx, messages_rx) = mpsc::unbounded();
+        let (engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        let injected = engine.injected_rx.take().unwrap();
+        (engine, injected, rx, (messages_tx, engine_tx))
+    }
+
+    /// Runs `engine` until `n` injected reconnect failures fired; panics if
+    /// it ends first or they do not fire within 10 s.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn run_until_injected(
+        engine: &mut ConsumerEngine<crate::TokioExecutor>,
+        injected: &mut mpsc::UnboundedReceiver<()>,
+        n: usize,
+    ) {
+        let fired = async {
+            for _ in 0..n {
+                injected.next().await.expect("the engine is alive");
+            }
+        };
+        let ran = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::select(Box::pin(engine.engine()), Box::pin(fired)),
+        )
+        .await
+        .expect("the injected reconnect failures did not fire");
+        if let futures::future::Either::Left((res, _)) = ran {
+            panic!("the engine ended on a failed reconnect: {res:?}");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): which reconnect failures are retried. A TLS
+    /// failure (bad data, permission denied) and a DNS failure are
+    /// permanent; a timeout, a broker not ready or still holding the old
+    /// consumer are transient.
+    #[test]
+    fn only_transient_reconnect_failures_are_retried() {
+        use crate::{error::ServiceDiscoveryError as Sd, message::proto::ServerError as Se};
+        let io = |kind| Error::Connection(ConnectionError::Io(std::io::Error::new(kind, "x")));
+        let pulsar = |code| Error::Connection(ConnectionError::PulsarError(Some(code), None));
+        let cases = [
+            (io(std::io::ErrorKind::TimedOut), true),
+            (io(std::io::ErrorKind::ConnectionReset), true),
+            (io(std::io::ErrorKind::InvalidData), false),
+            (io(std::io::ErrorKind::PermissionDenied), false),
+            (pulsar(Se::ConsumerBusy), true),
+            (pulsar(Se::ServiceNotReady), true),
+            (pulsar(Se::AuthorizationError), false),
+            (pulsar(Se::TopicNotFound), false),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::MetadataError), None)),
+                true,
+            ),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::TooManyRequests), None)),
+                true,
+            ),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::TopicNotFound), None)),
+                false,
+            ),
+            (Error::ServiceDiscovery(Sd::NotFound), false),
+            (Error::ServiceDiscovery(Sd::DnsLookupError), false),
+        ];
+        for (err, transient) in cases {
+            assert_eq!(reconnect_is_transient(&err), transient, "{err:?}");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): a transient failure of the reconnect off a dead
+    /// connection is retried with the backoff; upstream ended the engine,
+    /// so the consumer died on the first lookup that failed during a broker
+    /// restart.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_reconnect_is_retried() {
+        let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+        run_until_injected(&mut engine, &mut injected, 3).await;
+    }
+
+    /// FORK-PATCH (3rdi): a permanent failure of that reconnect (here the
+    /// topic is not found) ends the engine as upstream did, so it reaches
+    /// the user instead of retrying forever.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_permanent_reconnect_failure_ends_the_engine() {
+        let (mut engine, _injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        engine.injected_permanent = true;
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+        let ended = tokio::time::timeout(Duration::from_secs(10), engine.engine())
+            .await
+            .expect("a permanent failure was retried");
+        assert!(
+            matches!(
+                ended,
+                Err(Error::ServiceDiscovery(
+                    crate::error::ServiceDiscoveryError::NotFound
+                ))
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(engine.reconnect_failures.load(Ordering::SeqCst), 2);
+    }
+
+    /// FORK-PATCH (3rdi): a connection that fails while a corrupt-window
+    /// resubscribe waits out a long backoff reconnects at once, not when
+    /// that resubscribe is due.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_failed_connection_does_not_wait_for_a_pending_corrupt_window_resubscribe() {
+        let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        engine.forced.due = Some(Instant::now() + Duration::from_secs(3600));
+        engine.forced.pending = Some(Pending::CorruptWindow);
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        run_until_injected(&mut engine, &mut injected, 1).await;
+    }
 
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
     /// multi-topic consumer, pool members) must both reconnect, not only the

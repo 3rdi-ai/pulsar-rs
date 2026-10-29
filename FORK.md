@@ -69,6 +69,23 @@ messages can raise it on purpose.
   every waiter and clears the entry. Waiters get a copy of the dial's own
   error (same variant, same I/O kind) instead of upstream's `Canceled`, so
   they classify the retry the same way.
+- **A failed reconnect is retried, never the end of the consumer**
+  (FORK-PATCH in `src/consumer/engine.rs` `engine`): upstream returned the
+  error when the reconnect off a dead connection failed (a lookup during a
+  broker restart), so the consumer died. A transient failure (I/O or a
+  timeout, a dropped connection, ServiceNotReady, ConsumerBusy, a lookup
+  MetadataError or TooManyRequests) is now retried on the
+  forced-resubscribe backoff (100 ms doubling to 60 s, the Java client's),
+  and no flow is sent on the dead connection meanwhile. A permanent one
+  (topic not found or terminated, not authorized, incompatible schema, a
+  TLS failure such as InvalidData or PermissionDenied, a DNS failure)
+  still ends the engine, so it reaches the user instead of retrying
+  forever. DNS failure ends it as upstream does: our clients reach the
+  brokers through the stable proxy Service, so a restarted broker pod's
+  headless DNS name never fails for them. Deferred: a bounded DNS retry
+  for deployments that reach brokers directly. A pending corrupt-window resubscribe never delays the reconnect
+  off a failed connection, and each retry logs its own reason
+  (prophesee-service-rs #284).
 
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
