@@ -165,11 +165,53 @@ pub(crate) fn tls_failure_is_transient(_e: &io::Error) -> Option<bool> {
     feature = "async-std-rustls-runtime-ring"
 ))]
 pub(crate) fn rustls_error_is_transient(e: &rustls::Error) -> bool {
-    matches!(
-        e,
+    match e {
+        // a plaintext port answered: a misconfiguration, fail fast
+        rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => false,
+        // a broker shutting down mid-handshake
         rustls::Error::InvalidMessage(_)
-            | rustls::Error::AlertReceived(rustls::AlertDescription::InternalError)
-    )
+        | rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => true,
+        _ => false,
+    }
+}
+
+/// FORK-PATCH (3rdi): the rustls error behind `e`, when it is one the
+/// consumer retries (see [`rustls_error_is_transient`]): its text labels a
+/// streak of the same failure.
+#[cfg(any(
+    feature = "tokio-rustls-runtime-aws-lc-rs",
+    feature = "tokio-rustls-runtime-ring",
+    feature = "async-std-rustls-runtime-aws-lc-rs",
+    feature = "async-std-rustls-runtime-ring"
+))]
+pub(crate) fn tls_transient_label(e: &ConnectionError) -> Option<String> {
+    let tls = match e {
+        ConnectionError::Io(e) => e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        #[cfg(all(
+            any(
+                feature = "tokio-rustls-runtime-aws-lc-rs",
+                feature = "tokio-rustls-runtime-ring",
+                feature = "async-std-rustls-runtime-aws-lc-rs",
+                feature = "async-std-rustls-runtime-ring"
+            ),
+            not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+        ))]
+        ConnectionError::Tls(e) => Some(e),
+        _ => None,
+    }?;
+    rustls_error_is_transient(tls).then(|| tls.to_string())
+}
+
+#[cfg(not(any(
+    feature = "tokio-rustls-runtime-aws-lc-rs",
+    feature = "tokio-rustls-runtime-ring",
+    feature = "async-std-rustls-runtime-aws-lc-rs",
+    feature = "async-std-rustls-runtime-ring"
+)))]
+pub(crate) fn tls_transient_label(_e: &ConnectionError) -> Option<String> {
+    None
 }
 
 impl From<io::Error> for ConnectionError {

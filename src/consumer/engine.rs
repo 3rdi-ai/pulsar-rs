@@ -129,6 +129,57 @@ fn reconnect_is_transient(e: &Error) -> bool {
     }
 }
 
+/// FORK-PATCH (3rdi): how many times in a row the same TLS-transient
+/// reconnect failure repeats before its retries log at `error!`: a broker
+/// shutting down mid-handshake clears within a few retries, a TLS
+/// misconfiguration answering with the same alert never does.
+const TLS_TRANSIENT_ESCALATE_AFTER: u32 = 5;
+
+/// FORK-PATCH (3rdi): the streak of one TLS-transient reconnect failure.
+#[derive(Debug, Default)]
+struct TlsStreak {
+    last: Option<String>,
+    count: u32,
+}
+
+impl TlsStreak {
+    /// Records a failed reconnect (`label`: its TLS-transient failure, if
+    /// it is one); true once the same one has repeated
+    /// [`TLS_TRANSIENT_ESCALATE_AFTER`] times in a row.
+    fn record(&mut self, label: Option<String>) -> bool {
+        match label {
+            Some(label) if self.last.as_ref() == Some(&label) => {
+                self.count = self.count.saturating_add(1);
+            }
+            Some(label) => {
+                self.last = Some(label);
+                self.count = 1;
+            }
+            None => self.reset(),
+        }
+        self.count >= TLS_TRANSIENT_ESCALATE_AFTER
+    }
+
+    /// A reconnect succeeded.
+    fn reset(&mut self) {
+        self.last = None;
+        self.count = 0;
+    }
+}
+
+/// The TLS-transient failure behind a failed reconnect, if it is one.
+fn tls_transient_label(e: &Error) -> Option<String> {
+    use crate::error::ServiceDiscoveryError;
+    match e {
+        Error::Connection(e)
+        | Error::Consumer(ConsumerError::Connection(e))
+        | Error::ServiceDiscovery(ServiceDiscoveryError::Connection(e)) => {
+            crate::error::tls_transient_label(e)
+        }
+        _ => None,
+    }
+}
+
 /// FORK-PATCH (3rdi): why a resubscribe is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -281,6 +332,8 @@ pub struct ConsumerEngine<Exe: Executor> {
     generation: u64,
     /// The forced-resubscribe schedule.
     forced: ForcedResubscribe,
+    /// FORK-PATCH (3rdi): the streak of one TLS-transient reconnect failure.
+    tls_streak: TlsStreak,
     /// The first forced-resubscribe delay: zero in this crate's tests, so
     /// they wait on nothing.
     forced_initial_backoff: Duration,
@@ -349,6 +402,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             forced_resubscribes: Arc::new(AtomicU64::new(0)),
             generation: 0,
             forced: ForcedResubscribe::default(),
+            tls_streak: TlsStreak::default(),
             forced_initial_backoff: if cfg!(test) {
                 Duration::ZERO
             } else {
@@ -435,7 +489,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     if !reconnect_is_transient(&e) {
                         return Err(self.end_with(e));
                     }
-                    warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
+                    if self.tls_streak.record(tls_transient_label(&e)) {
+                        error!(
+                            "{}: reconnect failed: {e}; retrying (the same TLS failure {} times in a row: check the broker's TLS configuration)",
+                            self.debug_format(),
+                            self.tls_streak.count
+                        );
+                    } else {
+                        warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
+                    }
                     self.schedule_resubscribe(true, Pending::ConnectionRetry);
                 }
             }
@@ -1117,6 +1179,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .unbounded_send(self.unacked_messages.len());
 
         self.forced.completed(Instant::now());
+        self.tls_streak.reset();
         self.remaining_messages = self.batch_size as i64;
         self.messages_rx = Some(messages);
 
@@ -1281,6 +1344,10 @@ mod tests {
         let cases = [
             (
                 tls(Tls::InvalidMessage(InvalidMessage::InvalidContentType)),
+                false,
+            ),
+            (
+                tls(Tls::InvalidMessage(InvalidMessage::MissingData("x"))),
                 true,
             ),
             (
@@ -1314,6 +1381,74 @@ mod tests {
                 "a waiter's copy"
             );
         }
+    }
+
+    /// FORK-PATCH (3rdi): an InvalidData I/O error with no rustls error
+    /// inside stays permanent on a rustls build.
+    #[test]
+    #[cfg(any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    fn invalid_data_without_a_rustls_error_is_permanent() {
+        let err = ConnectionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not tls",
+        ));
+        assert!(!reconnect_is_transient(&Error::Connection(err)));
+    }
+
+    /// FORK-PATCH (3rdi): the `ConnectionError::Tls` variant (rustls-only
+    /// builds) is classified as the rustls error it holds.
+    #[test]
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    ))]
+    fn the_tls_variant_is_classified_by_its_rustls_error() {
+        use rustls::{AlertDescription, Error as Tls, InvalidMessage};
+        let cases = [
+            (Tls::AlertReceived(AlertDescription::InternalError), true),
+            (
+                Tls::InvalidMessage(InvalidMessage::InvalidContentType),
+                false,
+            ),
+            (Tls::NoCertificatesPresented, false),
+        ];
+        for (tls, transient) in cases {
+            let err = Error::Connection(ConnectionError::Tls(tls));
+            assert_eq!(reconnect_is_transient(&err), transient, "{err:?}");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): the same TLS-transient failure escalates on its
+    /// 5th repeat in a row; another failure starts over, a success resets.
+    #[test]
+    fn a_repeated_tls_transient_failure_escalates() {
+        let mut streak = TlsStreak::default();
+        let alert = || Some("received fatal alert: InternalError".to_string());
+        for _ in 1..TLS_TRANSIENT_ESCALATE_AFTER {
+            assert!(!streak.record(alert()));
+        }
+        assert!(streak.record(alert()), "the 5th repeat escalates");
+        assert!(streak.record(alert()), "and stays escalated");
+        assert!(
+            !streak.record(Some("another".to_string())),
+            "a new failure starts over"
+        );
+        assert!(!streak.record(None), "a non-TLS failure resets");
+        for _ in 1..TLS_TRANSIENT_ESCALATE_AFTER {
+            assert!(!streak.record(alert()));
+        }
+        streak.reset();
+        assert!(!streak.record(alert()), "a success resets");
     }
 
     /// FORK-PATCH (3rdi): which reconnect failures are retried. A TLS
