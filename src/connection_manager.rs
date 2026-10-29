@@ -329,32 +329,6 @@ pub(crate) mod tests {
         assert!(manager.connections.lock().await.get(&broker).is_none());
     }
 
-    /// FORK-PATCH (3rdi): a detached dial that every caller stopped waiting
-    /// for gives up at its next retry and clears the entry.
-    #[tokio::test(start_paused = true)]
-    #[cfg(any(
-        feature = "tokio-runtime",
-        feature = "tokio-rustls-runtime-aws-lc-rs",
-        feature = "tokio-rustls-runtime-ring"
-    ))]
-    async fn a_dial_nobody_waits_for_gives_up() {
-        let mut manager = silent_broker::undialed_manager(&mute_broker().await);
-        manager.connection_retry_options.max_retries = 1000;
-        let broker = manager.get_base_address();
-        {
-            let first = manager.get_connection(&broker);
-            futures::pin_mut!(first);
-            assert!(futures::poll!(first.as_mut()).is_pending());
-        } // the only caller is dropped
-
-        // virtual time: one connection timeout and a backoff go by
-        tokio::time::sleep(Duration::from_secs(120)).await;
-        assert!(
-            manager.connections.lock().await.get(&broker).is_none(),
-            "the dial kept retrying for nobody"
-        );
-    }
-
     /// FORK-PATCH (3rdi): once a connection failed, the pool hands out a
     /// new one, even after a consumer engine read the error
     /// (prophesee-service-rs #284).
@@ -650,15 +624,6 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
-    /// Whether every caller queued on `broker`'s `Connecting` entry stopped
-    /// waiting (its future was dropped).
-    async fn nobody_waits(&self, broker: &BrokerAddress) -> bool {
-        match self.connections.lock().await.get(broker) {
-            Some(ConnectionStatus::Connecting(v)) => v.iter().all(|tx| tx.is_canceled()),
-            _ => false,
-        }
-    }
-
     /// FORK-PATCH (3rdi): dials `broker` for the callers queued on its
     /// `Connecting` entry, detached from all of them. Whatever ends the
     /// dial (an error, a panic, a failed keepalive spawn) resolves every
@@ -778,12 +743,6 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         current_backoff.as_millis()
                     );
                     self.executor.delay(current_backoff).await;
-                    // FORK-PATCH (3rdi): a detached dial that every caller
-                    // stopped waiting for gives up instead of retrying on.
-                    if claimed && self.nobody_waits(broker).await {
-                        debug!("nobody waits for the dial to {} any more", broker.url);
-                        return Err(ConnectionError::Canceled);
-                    }
                 }
                 Err(e) => {
                     return Err(e);
