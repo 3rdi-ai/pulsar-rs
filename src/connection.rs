@@ -245,13 +245,21 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
         key: &RequestKey,
         cx: &mut Context<'_>,
     ) -> Result<Option<oneshot::Sender<Message>>, ()> {
+        // FORK-PATCH (3rdi): a resolver nobody waits on (its request was
+        // dropped, its cancellation still in the channel) counts as absent:
+        // a resend's registration may be behind it in the channel
         if let Some(resolver) = self.pending_requests.remove(key) {
-            return Ok(Some(resolver));
+            if !resolver.is_canceled() {
+                return Ok(Some(resolver));
+            }
         }
         if !self.drain_registrations(cx) {
             return Err(());
         }
-        Ok(self.pending_requests.remove(key))
+        Ok(self
+            .pending_requests
+            .remove(key)
+            .filter(|resolver| !resolver.is_canceled()))
     }
 }
 
@@ -2657,6 +2665,48 @@ mod tests {
             "a stale reply was kept"
         );
         assert!(receiver.pending_requests.is_empty());
+    }
+
+    /// FORK-PATCH (3rdi): a request dropped but not yet cancelled (its
+    /// cancellation still in the channel) leaves a resolver nobody waits
+    /// on: a reply for a resend under the same key, read in the poll that
+    /// registers the resend, goes to the resend, not to the dead resolver.
+    #[tokio::test]
+    async fn a_dead_resolver_does_not_take_a_resends_reply() {
+        let (_message_tx, message_rx) = mpsc::unbounded();
+        let (control_tx, _control_rx) = async_channel::unbounded();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (_receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
+        let (auth_challenge_tx, _auth_challenge_rx) = mpsc::unbounded();
+        let key = RequestKey::ProducerSend {
+            producer_id: 1,
+            sequence_id: 5,
+        };
+        let (inbound, mut resent) = racing_inbound(
+            registrations_tx.clone(),
+            key.clone(),
+            send_receipt(1, 5),
+            message_rx,
+        );
+        let mut receiver = Receiver::new(
+            inbound,
+            control_tx,
+            SharedError::new(),
+            registrations_rx,
+            receiver_shutdown_rx,
+            auth_challenge_tx,
+            Default::default(),
+        );
+        // the first send registered, then its future was dropped; its
+        // cancellation has not reached the receiver yet
+        drop(register(&registrations_tx, key));
+
+        assert!(futures::poll!(&mut receiver).is_pending());
+        let msg = resent
+            .try_recv()
+            .unwrap()
+            .expect("the resend's receipt went to the dead resolver");
+        assert!(msg.command.send_receipt.is_some());
     }
 
     /// FORK-PATCH (3rdi): a producer resends under the same sequence id, so
