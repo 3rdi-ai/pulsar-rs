@@ -103,7 +103,8 @@ messages can raise it on purpose.
   terminated, not authorized, ...) was retried on the backoff forever,
   the consumer silent. It now ends the engine, as a connection retry that
   fails for good does; a transient failure is still retried. In both
-  cases the error is queued for the consumer: a single-topic consumer's
+  cases the error is queued for the consumer (kept aside when the queue
+  is full, and yielded after it drains): a single-topic consumer's
   stream yields it and then ends (upstream's stream just ended, the error
   only logged by the engine task). A multi-topic consumer still logs the
   error and drops that topic (`consumer/multi.rs`, upstream behaviour for

@@ -61,6 +61,9 @@ struct Budget {
     /// The engine's current subscription session; items from an older one are stale.
     generation: AtomicU64,
     state: Mutex<State>,
+    /// FORK-PATCH (3rdi): the error that ended the engine when the channel
+    /// was full; yielded once the channel is drained and closed.
+    terminal: Mutex<Option<Error>>,
 }
 
 impl Budget {
@@ -148,17 +151,30 @@ impl QueueSender {
     }
 
     /// FORK-PATCH (3rdi): queues the error that ends the consumer, without
-    /// waiting (an error is free of the byte budget). False when the queue
-    /// is full or the consumer is gone.
+    /// waiting (an error is free of the byte budget). When the channel is
+    /// full it is kept aside and yielded after the channel drains. False
+    /// only when the consumer is gone.
     pub(crate) fn try_send_error(&mut self, e: Error) -> bool {
         let generation = self.budget.generation.load(Ordering::Acquire);
-        self.tx
-            .try_send(Queued {
-                generation,
-                bytes: 0,
-                item: Err(e),
-            })
-            .is_ok()
+        match self.tx.try_send(Queued {
+            generation,
+            bytes: 0,
+            item: Err(e),
+        }) {
+            Ok(()) => true,
+            Err(full) if full.is_full() => {
+                let item = full.into_inner().item;
+                if let Err(e) = item {
+                    *self
+                        .budget
+                        .terminal
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(e);
+                }
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Starts a new subscription session: every item queued so far, and
@@ -217,7 +233,15 @@ impl Stream for QueueReceiver {
                         return Poll::Ready(Some(item));
                     }
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    let terminal = self
+                        .budget
+                        .terminal
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    return Poll::Ready(terminal.map(Err));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -234,6 +258,7 @@ pub(crate) fn receive_queue(capacity: usize, max_bytes: usize) -> (QueueSender, 
         generation: AtomicU64::new(0),
         max: max_bytes,
         state: Mutex::new(State::default()),
+        terminal: Mutex::new(None),
     });
     (
         QueueSender {
@@ -304,6 +329,25 @@ mod tests {
         );
         assert!(pending.as_mut().poll(&mut cx).is_ready());
         assert_eq!(rx.queued_bytes(), budget);
+    }
+
+    /// FORK-PATCH (3rdi): the error that ends the consumer is never lost to
+    /// a full queue: the receiver yields it after everything queued before
+    /// it, then ends.
+    #[test]
+    fn the_ending_error_survives_a_full_queue() {
+        // `mpsc::channel(0)` holds one item per sender.
+        let (mut tx, mut rx) = receive_queue(0, 1024 * 1024);
+        tx.send(payload(100)).now_or_never().unwrap().unwrap();
+        assert!(tx.try_send_error(Error::Custom("gone".to_string())));
+        drop(tx);
+
+        assert!(matches!(rx.next().now_or_never(), Some(Some(Ok(_)))));
+        assert!(
+            matches!(rx.next().now_or_never(), Some(Some(Err(Error::Custom(m)))) if m == "gone"),
+            "the ending error was lost"
+        );
+        assert!(matches!(rx.next().now_or_never(), Some(None)));
     }
 
     /// One payload larger than the whole budget still goes through an empty
