@@ -311,15 +311,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         debug!("starting the consumer engine for topic {}", self.topic);
 
         loop {
-            if !self.connection.is_valid() {
-                if let Some(err) = self.connection.error() {
-                    error!(
-                        "Consumer: connection {} is not valid: {:?}",
-                        self.connection.id(),
-                        err
-                    );
-                    self.reconnect().await?;
-                }
+            if connection_failed(&self.connection) {
+                self.reconnect().await?;
             }
 
             if self.forced.due.is_some_and(|due| Instant::now() >= due) {
@@ -985,9 +978,47 @@ impl<Exe: Executor> std::ops::Drop for ConsumerEngine<Exe> {
     }
 }
 
+/// FORK-PATCH (3rdi): whether an engine on `connection` must reconnect.
+/// Every engine sharing a failed connection must, but only the first takes
+/// the error to log it; upstream reconnected only when `error()` returned
+/// one, so the other engines stalled on the dead connection
+/// (prophesee-service-rs #284).
+fn connection_failed<Exe: Executor>(connection: &Connection<Exe>) -> bool {
+    if connection.is_valid() {
+        return false;
+    }
+    error!(
+        "Consumer: connection {} is not valid: {:?}",
+        connection.id(),
+        connection.error()
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
+    /// multi-topic consumer, pool members) must both reconnect, not only the
+    /// one that read the error (prophesee-service-rs #284).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn every_engine_on_a_failed_connection_reconnects() {
+        use crate::connection_manager::tests::silent_broker;
+
+        let (manager, broker) = silent_broker::manager().await;
+        let shared = manager.get_connection(&broker).await.unwrap();
+        assert!(!connection_failed(&shared), "a live connection is kept");
+        silent_broker::fail(&shared).await;
+
+        assert!(connection_failed(&shared), "the first engine reconnects");
+        assert!(connection_failed(&shared), "the second engine reconnects");
+    }
 
     /// Models the broker's permit counter beside the engine's window: the
     /// broker debits the declared count, the engine books the same, and

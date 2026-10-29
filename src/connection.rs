@@ -2244,4 +2244,71 @@ mod tests {
             _ => panic!("Unexpected message"),
         };
     }
+
+    /// FORK-PATCH (3rdi): a connection whose request timed out is dead for
+    /// good. Reading the error (the consumer engine does, to log it) must not
+    /// make it valid again, or the connection manager hands the dead
+    /// connection to every later lookup (prophesee-service-rs #284).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn reading_the_error_does_not_revive_a_timed_out_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .map(|stream| tokio_util::codec::Framed::new(stream, Codec))
+            .unwrap();
+        let mut server_stream = listener
+            .accept()
+            .await
+            .map(|(stream, _)| tokio_util::codec::Framed::new(stream, Codec))
+            .unwrap();
+        server_stream
+            .send(Message {
+                command: BaseCommand {
+                    connected: Some(CommandConnected {
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                payload: None,
+            })
+            .await
+            .unwrap();
+
+        let sender = Connection::connect(
+            Uuid::new_v4(),
+            stream,
+            None,
+            None,
+            TokioExecutor.into(),
+            Duration::from_millis(200),
+            100,
+        )
+        .await
+        .unwrap();
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            url: url::Url::parse("pulsar://127.0.0.1:6650").unwrap(),
+            sender,
+        };
+        assert!(connection.is_valid());
+
+        // the broker accepts the request and never answers: the timeout fires
+        let lookup = connection
+            .sender()
+            .lookup_topic("persistent://t/n/x", false);
+        assert!(lookup.await.is_err(), "the unanswered lookup must time out");
+        assert!(!connection.is_valid(), "a timed-out connection is invalid");
+
+        assert!(connection.error().is_some(), "the timeout is reported once");
+        assert!(
+            !connection.is_valid(),
+            "reading the error must not revive the dead connection"
+        );
+        drop(server_stream);
+    }
 }

@@ -82,8 +82,104 @@ impl OperationRetryOptions {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A fake broker for connection-pool tests: it answers every
+    /// `CommandConnect` with `CommandConnected` and never answers anything
+    /// else, so any request on its connections times out.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    pub(crate) mod silent_broker {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        use super::*;
+        use crate::{
+            message::{BaseCommand, Codec, Message},
+            proto::CommandConnected,
+            TokioExecutor,
+        };
+
+        /// A manager on a silent broker with a 200 ms operation timeout,
+        /// and the broker's address.
+        pub(crate) async fn manager() -> (ConnectionManager<TokioExecutor>, BrokerAddress) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                        while let Some(Ok(msg)) = framed.next().await {
+                            if msg.command.connect.is_some() {
+                                let connected = Message {
+                                    command: BaseCommand {
+                                        r#type: 3,
+                                        connected: Some(CommandConnected::default()),
+                                        ..Default::default()
+                                    },
+                                    payload: None,
+                                };
+                                if framed.send(connected).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            let manager = ConnectionManager::new(
+                format!("pulsar://127.0.0.1:{port}"),
+                None,
+                None,
+                OperationRetryOptions {
+                    operation_timeout: Duration::from_millis(200),
+                    ..Default::default()
+                },
+                None,
+                100,
+                Arc::new(TokioExecutor),
+            )
+            .await
+            .unwrap();
+            let broker = manager.get_base_address();
+            (manager, broker)
+        }
+
+        /// Times out a request on `conn`, so it fails as on a broker restart.
+        pub(crate) async fn fail(conn: &Connection<TokioExecutor>) {
+            let lookup = conn.sender().lookup_topic("persistent://t/n/x", false);
+            assert!(lookup.await.is_err(), "the unanswered lookup must time out");
+            assert!(!conn.is_valid(), "a timed-out connection is invalid");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): once a connection timed out, the pool hands out a
+    /// new one, even after a consumer engine read the error
+    /// (prophesee-service-rs #284).
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn the_pool_replaces_a_connection_whose_error_was_read() {
+        let (manager, broker) = silent_broker::manager().await;
+        let dead = manager.get_connection(&broker).await.unwrap();
+        silent_broker::fail(&dead).await;
+        assert!(dead.error().is_some(), "the engine reads the error");
+
+        let next = manager.get_connection(&broker).await.unwrap();
+        assert_ne!(
+            next.id(),
+            dead.id(),
+            "the pool handed out the dead connection"
+        );
+        assert!(next.is_valid());
+    }
 
     #[test]
     fn test_allow_retry_no_max_retries() {

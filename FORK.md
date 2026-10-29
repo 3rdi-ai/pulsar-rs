@@ -39,6 +39,18 @@ messages can raise it on purpose.
 
 ## Unreleased
 
+- **A failed connection stays failed** (FORK-PATCH in `src/error.rs`
+  `SharedError::remove` and `src/consumer/engine.rs` `connection_failed`):
+  upstream `Connection::error()` cleared the connection's error flag, so
+  after a request timed out (a broker restart) the consumer engine that
+  read the error made the dead connection `is_valid()` again. The
+  connection manager then kept handing it to every lookup (minutes of
+  `timedout sending message` until a ping timeout), and every other engine
+  on that connection stopped reconnecting. Reading the error now leaves the
+  flag set, the manager replaces the connection, and every engine on an
+  invalid connection reconnects, whether or not it took the error
+  (prophesee-service-rs #284). Drop when upstream stops clearing the flag.
+
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
