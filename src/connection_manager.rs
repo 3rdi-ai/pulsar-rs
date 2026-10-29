@@ -203,6 +203,7 @@ pub(crate) mod tests {
                 certificate_chain: vec![],
                 outbound_channel_size: 100,
                 dial_panics: false,
+                give_up_gate: Default::default(),
             }
         }
 
@@ -329,6 +330,57 @@ pub(crate) mod tests {
         assert!(manager.connections.lock().await.get(&broker).is_none());
     }
 
+    /// FORK-PATCH (3rdi): a detached dial every caller stopped waiting for
+    /// gives up, and a caller arriving right after that gets a fresh dial,
+    /// never the abandoned one's `Canceled`.
+    #[tokio::test(start_paused = true)]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_caller_after_an_abandoned_dial_gets_a_fresh_one() {
+        let mut manager = silent_broker::undialed_manager(&mute_broker().await);
+        manager.connection_retry_options.max_retries = 1000;
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (go_tx, go_rx) = oneshot::channel();
+        *manager.give_up_gate.lock().unwrap() = Some((reached_tx, go_rx));
+        let broker = manager.get_base_address();
+
+        {
+            let first = manager.get_connection(&broker);
+            futures::pin_mut!(first);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+        } // the only caller is dropped
+
+        // paused time steps through the connection timeout and the backoff
+        // until the dial gives up; it holds there
+        reached_rx.await.expect("the abandoned dial never gave up");
+
+        let late = manager.get_connection(&broker);
+        futures::pin_mut!(late);
+        assert!(futures::poll!(late.as_mut()).is_pending());
+
+        // the abandoned dial returns
+        go_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        match futures::poll!(late.as_mut()) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(Ok(_)) => {}
+            std::task::Poll::Ready(Err(e)) => {
+                panic!("the late caller got the abandoned dial's end: {e:?}")
+            }
+        }
+        assert!(
+            matches!(
+                manager.connections.lock().await.get(&broker),
+                Some(ConnectionStatus::Connecting(v)) if !v.is_empty()
+            ),
+            "the late caller's fresh dial lost its entry"
+        );
+    }
+
     /// FORK-PATCH (3rdi): once a connection failed, the pool hands out a
     /// new one, even after a consumer engine read the error
     /// (prophesee-service-rs #284).
@@ -451,7 +503,14 @@ pub struct ConnectionManager<Exe: Executor> {
     /// Test seam: the dial panics.
     #[cfg(test)]
     dial_panics: bool,
+    /// Test seam: a dial that gave up signals the first sender, then waits
+    /// for the second receiver before it returns.
+    #[cfg(test)]
+    give_up_gate: GiveUpGate,
 }
+
+#[cfg(test)]
+type GiveUpGate = Arc<std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>;
 
 impl<Exe: Executor> ConnectionManager<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -521,6 +580,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             outbound_channel_size,
             #[cfg(test)]
             dial_panics: false,
+            #[cfg(test)]
+            give_up_gate: Default::default(),
         };
         let broker_address = BrokerAddress {
             url: url.clone(),
@@ -624,17 +685,46 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
+    /// Removes `broker`'s `Connecting` entry when every caller queued on it
+    /// stopped waiting (its future was dropped); true when it did.
+    async fn give_up_if_nobody_waits(&self, broker: &BrokerAddress) -> bool {
+        let mut conns = self.connections.lock().await;
+        let abandoned = matches!(
+            conns.get(broker),
+            Some(ConnectionStatus::Connecting(v)) if v.iter().all(|tx| tx.is_canceled())
+        );
+        if abandoned {
+            conns.remove(broker);
+        }
+        abandoned
+    }
+
+    #[cfg(test)]
+    async fn at_give_up_gate(&self) {
+        let gate = self.give_up_gate.lock().unwrap().take();
+        if let Some((reached, go)) = gate {
+            let _ = reached.send(());
+            let _ = go.await;
+        }
+    }
+
     /// FORK-PATCH (3rdi): dials `broker` for the callers queued on its
     /// `Connecting` entry, detached from all of them. Whatever ends the
     /// dial (an error, a panic, a failed keepalive spawn) resolves every
     /// waiter and clears the entry, so no later caller queues forever.
     async fn dial_detached(self, broker: BrokerAddress) {
         use futures::FutureExt;
-        let dialed = std::panic::AssertUnwindSafe(self.connect_claimed(broker.clone(), true))
-            .catch_unwind()
-            .await;
+        let mut gave_up = false;
+        let dialed =
+            std::panic::AssertUnwindSafe(self.connect_claimed(broker.clone(), true, &mut gave_up))
+                .catch_unwind()
+                .await;
         let err = match dialed {
             Ok(Ok(_)) => return,
+            // its entry is gone (it had no waiter); any there now is a fresh
+            // dial's, whether the dial then returned or panicked
+            Ok(Err(_)) if gave_up => return,
+            Err(_) if gave_up => return,
             Ok(Err(e)) => e,
             Err(_) => ConnectionError::Unexpected("the connection dial panicked".to_string()),
         };
@@ -657,6 +747,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: &BrokerAddress,
         claimed: bool,
+        gave_up: &mut bool,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         let rx = if claimed {
             None
@@ -743,6 +834,19 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         current_backoff.as_millis()
                     );
                     self.executor.delay(current_backoff).await;
+                    // FORK-PATCH (3rdi): a detached dial that every caller
+                    // stopped waiting for gives up. The check and the removal
+                    // of its entry are one step under the pool lock, so a
+                    // caller arriving after it finds no entry and starts a
+                    // fresh dial, and one arriving before it keeps this dial
+                    // going.
+                    if claimed && self.give_up_if_nobody_waits(broker).await {
+                        debug!("nobody waits for the dial to {} any more", broker.url);
+                        *gave_up = true;
+                        #[cfg(test)]
+                        self.at_give_up_gate().await;
+                        return Err(ConnectionError::Canceled);
+                    }
                 }
                 Err(e) => {
                     return Err(e);
@@ -776,7 +880,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: BrokerAddress,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        self.connect_claimed(broker, false).await
+        self.connect_claimed(broker, false, &mut false).await
     }
 
     /// `claimed`: the caller already set this broker's entry to
@@ -786,8 +890,12 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: BrokerAddress,
         claimed: bool,
+        gave_up: &mut bool,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let c = match self.connect_inner(&broker, claimed).await {
+        let c = match self.connect_inner(&broker, claimed, gave_up).await {
+            // FORK-PATCH (3rdi): a dial that gave up removed its own entry;
+            // one there now belongs to a fresh dial
+            Err(e) if *gave_up => return Err(e),
             Err(e) => {
                 // the current ConnectionStatus is Connecting, containing
                 // notification channels for all the tasks waiting for the
