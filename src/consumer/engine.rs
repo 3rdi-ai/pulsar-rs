@@ -1399,6 +1399,111 @@ mod tests {
         assert!(closed, "the best-effort close was sent");
     }
 
+    /// FORK-PATCH (3rdi): on a live connection the close still waits for
+    /// the broker's answer, however slow (up to the operation timeout); only
+    /// a failed connection caps it.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_reconnect_off_a_live_connection_waits_for_the_close() {
+        use std::sync::atomic::AtomicBool;
+
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            connection_manager::OperationRetryOptions,
+            consumer::queue::receive_queue,
+            message::{BaseCommand, Codec, Message},
+            proto::{CommandConnected, CommandSuccess},
+            Pulsar, TokioExecutor,
+        };
+
+        // a broker that answers CloseConsumer after 3 s, slower than the
+        // cap on a failed connection
+        let answered = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let flag = Arc::clone(&answered);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let flag = Arc::clone(&flag);
+                tokio::spawn(async move {
+                    let mut framed = tokio_util::codec::Framed::new(stream, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: 3,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if let Some(close) = msg.command.close_consumer {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            flag.store(true, Ordering::SeqCst);
+                            BaseCommand {
+                                r#type: 13,
+                                success: Some(CommandSuccess {
+                                    request_id: close.request_id,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        let reply = Message {
+                            command: reply,
+                            payload: None,
+                        };
+                        if framed.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+            .with_operation_retry_options(OperationRetryOptions {
+                operation_timeout: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = client.manager.get_base_connection().await.unwrap();
+        assert!(conn.is_valid());
+
+        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (_messages_tx, messages_rx) = mpsc::unbounded();
+        let (_engine_tx, engine_rx) = mpsc::unbounded();
+        let mut engine = ConsumerEngine::new(
+            client,
+            conn,
+            "persistent://t/n/x".to_string(),
+            "s".to_string(),
+            SubType::Exclusive,
+            1,
+            None,
+            tx,
+            messages_rx,
+            engine_rx,
+            10,
+            None,
+            None,
+            ConsumerOptions::default(),
+        );
+        // stop the reconnect right after the close, before the lookup
+        engine.reconnect_failures.store(1, Ordering::SeqCst);
+        assert!(engine.reconnect().await.is_err());
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "the reconnect did not wait for the live connection's close"
+        );
+    }
+
     /// FORK-PATCH (3rdi): two engines sharing one failed connection (a
     /// multi-topic consumer, pool members) must both reconnect, not only the
     /// one that read the error (prophesee-service-rs #284).
