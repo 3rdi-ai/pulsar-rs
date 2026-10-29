@@ -412,8 +412,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             {
                 if let Err(e) = self.reconnect().await {
                     if !reconnect_is_transient(&e) {
-                        error!("{}: reconnect failed for good: {e}", self.debug_format());
-                        return Err(e);
+                        return Err(self.end_with(e));
                     }
                     warn!("{}: reconnect failed: {e}; retrying", self.debug_format());
                     self.schedule_resubscribe(true, Pending::ConnectionRetry);
@@ -428,8 +427,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 let pending = self.forced.pending.unwrap_or(Pending::CorruptWindow);
                 if let Err(e) = self.reconnect().await {
                     if !reconnect_is_transient(&e) {
-                        error!("{}: reconnect failed for good: {e}", self.debug_format());
-                        return Err(e);
+                        return Err(self.end_with(e));
                     }
                     warn!(
                         "{}: {} and the resubscribe failed: {e}; retrying",
@@ -996,6 +994,22 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         );
     }
 
+    /// FORK-PATCH (3rdi): ends the engine on a reconnect that failed for
+    /// good. The error goes to the consumer's stream, which yields it and
+    /// then ends (the engine's own result is only logged by its task);
+    /// returns a summary for that log.
+    fn end_with(&mut self, e: Error) -> Error {
+        error!("{}: reconnect failed for good: {e}", self.debug_format());
+        let summary = Error::Custom(format!("the consumer ended: {e}"));
+        if !self.tx.try_send_error(e) {
+            warn!(
+                "{}: could not hand the error to the consumer stream",
+                self.debug_format()
+            );
+        }
+        summary
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
@@ -1294,22 +1308,44 @@ mod tests {
         feature = "tokio-rustls-runtime-ring"
     ))]
     async fn a_permanent_reconnect_failure_ends_the_engine() {
-        let (mut engine, _injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        let (mut engine, _injected, mut rx, _keep) = engine_on_a_failed_connection().await;
         engine.injected_permanent = true;
         engine.reconnect_failures.store(3, Ordering::SeqCst);
         let ended = tokio::time::timeout(Duration::from_secs(10), engine.engine())
             .await
             .expect("a permanent failure was retried");
+        assert!(ended.is_err());
+        assert_eq!(engine.reconnect_failures.load(Ordering::SeqCst), 2);
+
+        // the consumer's stream yields the error, then ends
+        drop(engine);
+        let first = rx.next().await;
         assert!(
             matches!(
-                ended,
-                Err(Error::ServiceDiscovery(
+                first,
+                Some(Err(Error::ServiceDiscovery(
                     crate::error::ServiceDiscoveryError::NotFound
-                ))
+                )))
             ),
-            "{ended:?}"
+            "the stream did not yield the error: {:?}",
+            first.map(|item| item.map(|(id, _)| id))
         );
-        assert_eq!(engine.reconnect_failures.load(Ordering::SeqCst), 2);
+        assert!(rx.next().await.is_none(), "the stream did not end");
+    }
+
+    /// FORK-PATCH (3rdi): the transient twin: the same failure, transient,
+    /// is retried and the engine goes on.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_transient_reconnect_failure_keeps_the_engine() {
+        let (mut engine, mut injected, _rx, _keep) = engine_on_a_failed_connection().await;
+        engine.injected_permanent = false;
+        engine.reconnect_failures.store(3, Ordering::SeqCst);
+        run_until_injected(&mut engine, &mut injected, 3).await;
     }
 
     /// FORK-PATCH (3rdi): a corrupt-window resubscribe that fails for good
@@ -1377,7 +1413,7 @@ mod tests {
             .await
             .unwrap();
         let conn = client.manager.get_base_connection().await.unwrap();
-        let (tx, _rx) = receive_queue(10, 1 << 20);
+        let (tx, mut rx) = receive_queue(10, 1 << 20);
         let (_messages_tx, messages_rx) = mpsc::unbounded();
         let (_engine_tx, engine_rx) = mpsc::unbounded();
         let mut engine = ConsumerEngine::new(
@@ -1408,15 +1444,22 @@ mod tests {
             engine.connection.is_valid(),
             "the connection branch ended it"
         );
+        assert!(ended.is_err());
+
+        // the consumer's stream yields the error, then ends
+        drop(engine);
+        let first = rx.next().await;
         assert!(
             matches!(
-                ended,
-                Err(Error::ServiceDiscovery(
+                first,
+                Some(Err(Error::ServiceDiscovery(
                     crate::error::ServiceDiscoveryError::NotFound
-                ))
+                )))
             ),
-            "{ended:?}"
+            "the stream did not yield the error: {:?}",
+            first.map(|item| item.map(|(id, _)| id))
         );
+        assert!(rx.next().await.is_none(), "the stream did not end");
     }
 
     /// FORK-PATCH (3rdi): a connection that fails while a corrupt-window

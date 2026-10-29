@@ -101,8 +101,14 @@ messages can raise it on purpose.
   (FORK-PATCH in `src/consumer/engine.rs` `engine`): a corrupt-window
   resubscribe whose reconnect failed permanently (topic gone or
   terminated, not authorized, ...) was retried on the backoff forever,
-  the consumer silent. It now ends the engine with that error, as a
-  connection retry does; a transient failure is still retried.
+  the consumer silent. It now ends the engine, as a connection retry that
+  fails for good does; a transient failure is still retried. In both
+  cases the error is queued for the consumer: a single-topic consumer's
+  stream yields it and then ends (upstream's stream just ended, the error
+  only logged by the engine task). A multi-topic consumer still logs the
+  error and drops that topic (`consumer/multi.rs`, upstream behaviour for
+  any error item, refused messages included); passing it to the user
+  there is a separate, larger change.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps

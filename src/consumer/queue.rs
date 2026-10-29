@@ -147,6 +147,20 @@ impl QueueSender {
         Ok(())
     }
 
+    /// FORK-PATCH (3rdi): queues the error that ends the consumer, without
+    /// waiting (an error is free of the byte budget). False when the queue
+    /// is full or the consumer is gone.
+    pub(crate) fn try_send_error(&mut self, e: Error) -> bool {
+        let generation = self.budget.generation.load(Ordering::Acquire);
+        self.tx
+            .try_send(Queued {
+                generation,
+                bytes: 0,
+                item: Err(e),
+            })
+            .is_ok()
+    }
+
     /// Starts a new subscription session: every item queued so far, and
     /// every one sent before the next call, is from the old session and the
     /// receiver drops it (releasing its bytes) instead of yielding it. An
