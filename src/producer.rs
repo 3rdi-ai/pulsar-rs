@@ -1,7 +1,8 @@
 //! Message publication
+#[cfg(any(feature = "flate2", feature = "snap"))]
+use std::io::Write;
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
-    io::Write,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -818,6 +819,15 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
 #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
 fn compress_message(
+    #[cfg_attr(
+        not(any(
+            feature = "lz4",
+            feature = "flate2",
+            feature = "zstd",
+            feature = "snap"
+        )),
+        allow(unused_mut)
+    )]
     mut message: ProducerMessage,
     compression: &Option<Compression>,
 ) -> Result<ProducerMessage, Error> {
