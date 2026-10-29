@@ -50,6 +50,19 @@ messages can raise it on purpose.
   flag set, the manager replaces the connection, and every engine on an
   invalid connection reconnects, whether or not it took the error
   (prophesee-service-rs #284). Drop when upstream stops clearing the flag.
+- **Only a failed keepalive ping retires a connection** (FORK-PATCH in
+  `src/connection.rs` `send_message`): upstream also set the
+  connection-wide error when a single request timed out, so one slow
+  lookup retired the connection for every producer and consumer on it.
+  The slow request now fails alone; the keepalive ping
+  (`ConnectionRetryOptions::keep_alive`, 60 s by default, timing out after
+  the operation timeout) declares a connection dead, as the Java client
+  does. Safe now that a dead connection can no longer be revived.
+- **One replacement connection per broker** (FORK-PATCH in
+  `src/connection_manager.rs` `get_connection`): a caller that finds no
+  connection, or an invalid one, marks the broker `Connecting` under the
+  pool lock before dialing, so concurrent callers queue for its
+  connection; upstream dialed one connection per caller.
 
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its

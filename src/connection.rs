@@ -810,7 +810,6 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         };
 
         let connection_id = self.connection_id;
-        let error = self.error.clone();
         let delay_f = self.executor.delay(self.operation_timeout);
         trace!(
             "Create timeout futures with operation timeout at {:?}",
@@ -829,13 +828,10 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                         "connection {} timedout sending message to the Pulsar server",
                         connection_id
                     );
-                    error.set(ConnectionError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            " connection {} timedout sending message to the Pulsar server",
-                            connection_id
-                        ),
-                    )));
+                    // FORK-PATCH (3rdi): a slow answer fails this request
+                    // only. Upstream also set the connection-wide error here,
+                    // retiring the connection for every user of it; as in
+                    // the Java client, only a failed keepalive ping does.
                     Err(ConnectionError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -2245,7 +2241,7 @@ mod tests {
         };
     }
 
-    /// FORK-PATCH (3rdi): a connection whose request timed out is dead for
+    /// FORK-PATCH (3rdi): a connection whose keepalive ping failed is dead for
     /// good. Reading the error (the consumer engine does, to log it) must not
     /// make it valid again, or the connection manager hands the dead
     /// connection to every later lookup (prophesee-service-rs #284).
@@ -2255,7 +2251,7 @@ mod tests {
         feature = "tokio-rustls-runtime-aws-lc-rs",
         feature = "tokio-rustls-runtime-ring"
     ))]
-    async fn reading_the_error_does_not_revive_a_timed_out_connection() {
+    async fn reading_the_error_does_not_revive_a_dead_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -2297,14 +2293,14 @@ mod tests {
         };
         assert!(connection.is_valid());
 
-        // the broker accepts the request and never answers: the timeout fires
-        let lookup = connection
-            .sender()
-            .lookup_topic("persistent://t/n/x", false);
-        assert!(lookup.await.is_err(), "the unanswered lookup must time out");
-        assert!(!connection.is_valid(), "a timed-out connection is invalid");
+        // the broker never answers the keepalive ping: the connection is dead
+        assert!(connection.sender().send_ping().await.is_err());
+        assert!(
+            !connection.is_valid(),
+            "a failed ping retires the connection"
+        );
 
-        assert!(connection.error().is_some(), "the timeout is reported once");
+        assert!(connection.error().is_some(), "the failure is reported once");
         assert!(
             !connection.is_valid(),
             "reading the error must not revive the dead connection"

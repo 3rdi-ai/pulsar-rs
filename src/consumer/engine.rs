@@ -987,11 +987,14 @@ fn connection_failed<Exe: Executor>(connection: &Connection<Exe>) -> bool {
     if connection.is_valid() {
         return false;
     }
-    error!(
-        "Consumer: connection {} is not valid: {:?}",
-        connection.id(),
-        connection.error()
-    );
+    match connection.error() {
+        Some(err) => error!(
+            "Consumer: connection {} is not valid: {:?}",
+            connection.id(),
+            err
+        ),
+        None => debug!("Consumer: connection {} is not valid", connection.id()),
+    }
     true
 }
 

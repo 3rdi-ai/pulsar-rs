@@ -149,15 +149,55 @@ pub(crate) mod tests {
             (manager, broker)
         }
 
-        /// Times out a request on `conn`, so it fails as on a broker restart.
+        /// Fails the keepalive ping on `conn`, as on a broker restart.
         pub(crate) async fn fail(conn: &Connection<TokioExecutor>) {
-            let lookup = conn.sender().lookup_topic("persistent://t/n/x", false);
-            assert!(lookup.await.is_err(), "the unanswered lookup must time out");
-            assert!(!conn.is_valid(), "a timed-out connection is invalid");
+            assert!(conn.sender().send_ping().await.is_err());
+            assert!(!conn.is_valid(), "a failed ping retires the connection");
         }
     }
 
-    /// FORK-PATCH (3rdi): once a connection timed out, the pool hands out a
+    /// FORK-PATCH (3rdi): a request the broker is slow to answer fails
+    /// alone; only the keepalive ping retires a connection (as the Java
+    /// client does), so one slow lookup never drops every consumer on it.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_slow_request_does_not_retire_the_connection() {
+        let (manager, broker) = silent_broker::manager().await;
+        let conn = manager.get_connection(&broker).await.unwrap();
+        let lookup = conn.sender().lookup_topic("persistent://t/n/x", false);
+        assert!(lookup.await.is_err(), "the unanswered lookup times out");
+        assert!(conn.is_valid(), "a request timeout retired the connection");
+        let again = manager.get_connection(&broker).await.unwrap();
+        assert_eq!(again.id(), conn.id());
+    }
+
+    /// FORK-PATCH (3rdi): callers replacing the same dead connection at
+    /// once share one new connection instead of dialing one each.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn concurrent_callers_share_one_replacement_connection() {
+        let (manager, broker) = silent_broker::manager().await;
+        let dead = manager.get_connection(&broker).await.unwrap();
+        silent_broker::fail(&dead).await;
+
+        let (a, b) = futures::join!(
+            manager.get_connection(&broker),
+            manager.get_connection(&broker)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.id(), dead.id());
+        assert_eq!(a.id(), b.id(), "each caller dialed its own connection");
+    }
+
+    /// FORK-PATCH (3rdi): once a connection failed, the pool hands out a
     /// new one, even after a consumer engine read the error
     /// (prophesee-service-rs #284).
     #[tokio::test]
@@ -386,9 +426,14 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         trace!("Looking for connection to {}...", broker.url);
         let rx = {
             let mut conns = self.connections.lock().await;
+            // FORK-PATCH (3rdi): a caller that finds no usable connection
+            // claims the dial under this lock (`Connecting`), so callers
+            // racing it queue for its connection instead of each dialing
+            // one (upstream left the entry as it was until `connect_inner`).
             match conns.get_mut(broker) {
                 None => {
                     trace!("[] no connection for {}", broker.url);
+                    conns.insert(broker.clone(), ConnectionStatus::Connecting(Vec::new()));
                     None
                 }
                 Some(ConnectionStatus::Connected { conn, last_used }) => {
@@ -399,6 +444,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         return Ok(conn.clone());
                     } else {
                         warn!("[connected] invalid connection for {}", broker.url);
+                        conns.insert(broker.clone(), ConnectionStatus::Connecting(Vec::new()));
                         None
                     }
                 }
@@ -417,7 +463,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         match rx {
             None => {
                 info!("No existing connection, creating new for {}", broker.url);
-                self.connect(broker.clone()).await
+                self.connect_claimed(broker.clone(), true).await
             }
             Some(rx) => match rx.await {
                 Ok(res) => {
@@ -433,8 +479,11 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     async fn connect_inner(
         &self,
         broker: &BrokerAddress,
+        claimed: bool,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let rx = {
+        let rx = if claimed {
+            None
+        } else {
             match self
                 .connections
                 .lock()
@@ -545,7 +594,18 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: BrokerAddress,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let c = match self.connect_inner(&broker).await {
+        self.connect_claimed(broker, false).await
+    }
+
+    /// `claimed`: the caller already set this broker's entry to
+    /// `Connecting` and is the one to dial.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn connect_claimed(
+        &self,
+        broker: BrokerAddress,
+        claimed: bool,
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
+        let c = match self.connect_inner(&broker, claimed).await {
             Err(e) => {
                 // the current ConnectionStatus is Connecting, containing
                 // notification channels for all the tasks waiting for the
