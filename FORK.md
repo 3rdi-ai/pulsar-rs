@@ -165,6 +165,14 @@ messages can raise it on purpose.
   `i32::MAX`) leaves the consumer `blockedConsumerOnUnackedMsgs` with 0
   unacked after the client refuses and acknowledges it, so dispatch stops;
   4.0.5, 4.0.8 and 5.0.0 do not. The two Shared tests fail on 3.3.0.
+- **An abandoned dial gives up** (FORK-PATCH in `src/connection_manager.rs`
+  `give_up_if_nobody_waits`): a detached dial whose callers all stopped
+  waiting (every one cancelled) stops at its next retry instead of
+  retrying for nobody. The check and the removal of its `Connecting` entry
+  are one step under the pool lock, so a caller arriving after it finds
+  no entry and starts a fresh dial (one arriving before keeps this dial
+  going), and the dial that gave up never touches an entry it no longer
+  owns.
 - **OAuth2 and Basic credentials never reach formatted output**: the
   `Debug` and `Display` of `OAuth2Params` show the credentials URL as its
   scheme only (a `data:` URL embeds the client secret; a `file:` URL keeps
