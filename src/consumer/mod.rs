@@ -202,9 +202,9 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
                 let topic = c.topic().to_string();
                 let addr = client.lookup_topic(&topic).await?;
                 let config = c.config().clone();
-                let attempts = c.reconnect_attempts();
                 let replacement = TopicConsumer::new(client, topic, addr, config).await?;
-                replacement.carry_reconnect_attempts(attempts);
+                // the old count as of the swap (its engine may still count)
+                replacement.carry_reconnect_attempts(c.reconnect_attempts());
                 InnerConsumer::Single(replacement)
             }
             InnerConsumer::Multi(c) => {
