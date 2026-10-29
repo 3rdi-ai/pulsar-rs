@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -504,7 +503,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 due.saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(1))
             });
-            match Self::timeout(self.event_rx.next(), wait).await {
+            // FORK-PATCH (3rdi): on the runtime's own timer (the executor's
+            // delay), the one timer source of the engine
+            let tick = self.client.executor.delay(wait);
+            let next = match futures::future::select(Box::pin(self.event_rx.next()), Box::pin(tick))
+                .await
+            {
+                futures::future::Either::Left((event, _)) => Ok(event),
+                futures::future::Either::Right(_) => Err(()),
+            };
+            match next {
                 Err(_) => {
                     // If you are reading this comment, you may have an issue where you have
                     // received a batched message that is greater that the batch
@@ -1093,23 +1101,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 .unwrap_or_default(),
             topic = self.topic
         )
-    }
-
-    #[cfg(feature = "async-std")]
-    async fn timeout<F: Future<Output = O>, O>(
-        fut: F,
-        dur: Duration,
-    ) -> Result<O, async_std::future::TimeoutError> {
-        use async_std::prelude::FutureExt;
-        fut.timeout(dur).await
-    }
-
-    #[cfg(all(not(feature = "async-std"), feature = "tokio"))]
-    async fn timeout<F: Future<Output = O>, O>(
-        fut: F,
-        dur: Duration,
-    ) -> Result<O, tokio::time::error::Elapsed> {
-        tokio::time::timeout_at(tokio::time::Instant::now() + dur, fut).await
     }
 }
 
