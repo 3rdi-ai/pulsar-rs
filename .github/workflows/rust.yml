@@ -30,6 +30,11 @@ jobs:
       - name: Clippy (feature set B)
         run: cargo clippy --tests --no-default-features --features compression,tokio-rustls-runtime,async-std-rustls-runtime,auth-oauth2,telemetry,protobuf-src -- -D warnings
 
+      # 3rdi fork: sets A and B both build `compression`; a build without it
+      # (rustls only) compiled with unused-import warnings in its tests
+      - name: Clippy (feature set C, no compression)
+        run: cargo clippy --tests --no-default-features --features tokio-rustls-runtime,protobuf-src -- -D warnings
+
       - name: Check format
         run: cargo fmt --all --check
 
