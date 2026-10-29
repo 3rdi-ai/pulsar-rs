@@ -505,10 +505,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             });
             // FORK-PATCH (3rdi): on the runtime's own timer (the executor's
             // delay), the one timer source of the engine
-            let tick = self.client.executor.delay(wait);
-            let next = match futures::future::select(Box::pin(self.event_rx.next()), Box::pin(tick))
-                .await
-            {
+            let tick = std::pin::pin!(self.client.executor.delay(wait));
+            let event = std::pin::pin!(self.event_rx.next());
+            let next = match futures::future::select(event, tick).await {
                 futures::future::Either::Left((event, _)) => Ok(event),
                 futures::future::Either::Right(_) => Err(()),
             };
