@@ -74,12 +74,16 @@ messages can raise it on purpose.
   error when the reconnect off a dead connection failed (a lookup during a
   broker restart), so the consumer died. A transient failure (I/O or a
   timeout, a dropped connection, ServiceNotReady, ConsumerBusy, a lookup
-  MetadataError or TooManyRequests, a DNS failure) is now retried on the
+  MetadataError or TooManyRequests) is now retried on the
   forced-resubscribe backoff (100 ms doubling to 60 s, the Java client's),
   and no flow is sent on the dead connection meanwhile. A permanent one
-  (topic not found or terminated, not authorized, incompatible schema)
+  (topic not found or terminated, not authorized, incompatible schema, a
+  TLS failure such as InvalidData or PermissionDenied, a DNS failure)
   still ends the engine, so it reaches the user instead of retrying
-  forever. A pending corrupt-window resubscribe never delays the reconnect
+  forever. DNS failure ends it as upstream does: our clients reach the
+  brokers through the stable proxy Service, so a restarted broker pod's
+  headless DNS name never fails for them. Deferred: a bounded DNS retry
+  for deployments that reach brokers directly. A pending corrupt-window resubscribe never delays the reconnect
   off a failed connection, and each retry logs its own reason
   (prophesee-service-rs #284).
 

@@ -74,7 +74,10 @@ fn warn_due(last: Option<Instant>, now: Instant) -> bool {
 /// connection, a broker not ready or still holding the old consumer, a
 /// metadata hiccup or rate limit on lookup). Anything else (the topic is
 /// gone or terminated, the subscriber is not authorized, the schema is
-/// incompatible) is permanent and reaches the user.
+/// incompatible, a TLS failure, a DNS failure) is permanent and reaches the
+/// user. A DNS failure ends the engine as upstream: our clients reach the
+/// brokers through the stable proxy Service, so a restarted broker pod's
+/// headless DNS name never fails for them.
 fn reconnect_is_transient(e: &Error) -> bool {
     use crate::{error::ServiceDiscoveryError, message::proto::ServerError};
     fn server(code: &Option<ServerError>) -> bool {
@@ -90,9 +93,13 @@ fn reconnect_is_transient(e: &Error) -> bool {
     }
     fn connection(e: &ConnectionError) -> bool {
         match e {
-            ConnectionError::Io(_) | ConnectionError::Disconnected | ConnectionError::Canceled => {
-                true
-            }
+            // a TLS failure (bad certificate data, permission denied) is
+            // not going away on a retry
+            ConnectionError::Io(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
+            ),
+            ConnectionError::Disconnected | ConnectionError::Canceled => true,
             ConnectionError::PulsarError(code, _) => server(code),
             e => e.establish_retryable(),
         }
@@ -102,9 +109,7 @@ fn reconnect_is_transient(e: &Error) -> bool {
         Error::Consumer(ConsumerError::Connection(e)) => connection(e),
         Error::ServiceDiscovery(ServiceDiscoveryError::Connection(e)) => connection(e),
         Error::ServiceDiscovery(ServiceDiscoveryError::Query(code, _)) => server(code),
-        Error::ServiceDiscovery(
-            ServiceDiscoveryError::DnsLookupError | ServiceDiscoveryError::Canceled,
-        ) => true,
+        Error::ServiceDiscovery(ServiceDiscoveryError::Canceled) => true,
         _ => false,
     }
 }
@@ -1206,6 +1211,44 @@ mod tests {
         .expect("the injected reconnect failures did not fire");
         if let futures::future::Either::Left((res, _)) = ran {
             panic!("the engine ended on a failed reconnect: {res:?}");
+        }
+    }
+
+    /// FORK-PATCH (3rdi): which reconnect failures are retried. A TLS
+    /// failure (bad data, permission denied) and a DNS failure are
+    /// permanent; a timeout, a broker not ready or still holding the old
+    /// consumer are transient.
+    #[test]
+    fn only_transient_reconnect_failures_are_retried() {
+        use crate::{error::ServiceDiscoveryError as Sd, message::proto::ServerError as Se};
+        let io = |kind| Error::Connection(ConnectionError::Io(std::io::Error::new(kind, "x")));
+        let pulsar = |code| Error::Connection(ConnectionError::PulsarError(Some(code), None));
+        let cases = [
+            (io(std::io::ErrorKind::TimedOut), true),
+            (io(std::io::ErrorKind::ConnectionReset), true),
+            (io(std::io::ErrorKind::InvalidData), false),
+            (io(std::io::ErrorKind::PermissionDenied), false),
+            (pulsar(Se::ConsumerBusy), true),
+            (pulsar(Se::ServiceNotReady), true),
+            (pulsar(Se::AuthorizationError), false),
+            (pulsar(Se::TopicNotFound), false),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::MetadataError), None)),
+                true,
+            ),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::TooManyRequests), None)),
+                true,
+            ),
+            (
+                Error::ServiceDiscovery(Sd::Query(Some(Se::TopicNotFound), None)),
+                false,
+            ),
+            (Error::ServiceDiscovery(Sd::NotFound), false),
+            (Error::ServiceDiscovery(Sd::DnsLookupError), false),
+        ];
+        for (err, transient) in cases {
+            assert_eq!(reconnect_is_transient(&err), transient, "{err:?}");
         }
     }
 
